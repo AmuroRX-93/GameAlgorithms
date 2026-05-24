@@ -356,7 +356,12 @@ def reflect_off_paddle(ball, paddle, downward=False, angle_jitter=0.0):
     (used for the AI paddle which reflects the ball back toward the
     player). angle_jitter (radians) adds a small uniform noise to the
     reflection angle on AI bounces, which keeps two perfect AIs from
-    collapsing into a finite-state cycle in the demo modes."""
+    collapsing into a finite-state cycle in the demo modes.
+
+    The center zone gives angle=0 -> a perfectly vertical bounce, which
+    in Solo mode can trap the ball in a vertical column between paddle
+    and wall/brick forever. We always nudge that case off-vertical by a
+    small random amount."""
     rel = (ball.x - paddle.x) / PADDLE_W
     rel = max(0.0, min(1.0, rel))
     zone = int(rel * PADDLE_ZONES)
@@ -367,6 +372,12 @@ def reflect_off_paddle(ball, paddle, downward=False, angle_jitter=0.0):
     angle = math.radians(60.0) * t
     if angle_jitter:
         angle += random.uniform(-angle_jitter, angle_jitter)
+    # Anti-vertical guard: any time the bounce would leave the ball
+    # within ~3 degrees of straight up/down, nudge it 4-10 degrees off
+    # to one side. Prevents the "90deg trap" the user reported.
+    if abs(angle) < math.radians(3.0):
+        sign = 1.0 if random.random() < 0.5 else -1.0
+        angle = sign * math.radians(random.uniform(4.0, 10.0))
     # Clamp to slightly less than 90deg so vy stays well non-zero.
     angle = max(-math.radians(75.0), min(math.radians(75.0), angle))
     speed = min(BALL_SPEED_MAX, ball.speed * BALL_SPEEDUP)
