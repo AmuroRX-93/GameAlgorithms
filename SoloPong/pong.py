@@ -273,10 +273,15 @@ class AIPaddle:
             if use_brick_aim:
                 alive_bricks = [br for br in bricks if br.alive]
                 if alive_bricks:
-                    # Sparsity factor: 0 when full (>=24 bricks),
-                    # 1 when nearly empty (<=4). Lerp linearly.
+                    # Sparsity factor: 0.3 when full, 1.0 when nearly
+                    # empty. Even in a packed field we still bias
+                    # toward zones that will actually clip a brick
+                    # (in Solo demo there's no opponent, so the
+                    # "distance from opponent" term is meaningless).
+                    # The bias just gets stronger as bricks thin out
+                    # and missing them becomes costly.
                     n = len(alive_bricks)
-                    sparsity = max(0.0, min(1.0, (24 - n) / 20.0))
+                    sparsity = 0.3 + 0.7 * max(0.0, min(1.0, (50 - n) / 46.0))
                     for zi, (vx_out, vy_out) in enumerate(zone_vels):
                         hit_t = _raycast_first_brick_hit(
                             x_contact, contact_y, vx_out, vy_out,
