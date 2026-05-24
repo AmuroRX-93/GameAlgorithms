@@ -46,11 +46,15 @@ AI_PADDLE_Y = FIELD.top + 24       # AI paddle y in vs-AI mode
 PADDLE_SPEED = 720.0
 PADDLE_ZONES = 5
 
-# AI tuning. The AI is intentionally fast enough to always reach its
-# target; what makes the game playable is that it adds a small return
-# wobble so the ball trajectory keeps changing.
-AI_PADDLE_SPEED = 1100.0
-AI_RETURN_JITTER = 0.18            # 0..1, fraction of paddle half used as offset
+# AI tuning. The AI is fast enough to always reach its target; the
+# return-aim strategy makes it actually fun. Instead of meeting the
+# ball at paddle center (which produces 90deg returns), the AI biases
+# the contact point toward an edge zone so the bounce angle is large.
+# AI_AIM_OFFSET is the contact point as a fraction of half-paddle-width:
+# 0.85 means hit the ball at 85% out from center, deep in the edge
+# zone of the 5-zone reflection table.
+AI_PADDLE_SPEED = 1200.0
+AI_AIM_OFFSET = 0.85
 
 BALL_R = 7
 BALL_SPEED_START = 380.0
@@ -62,10 +66,6 @@ BRICK_COLS = 12
 BRICK_GAP = 4
 BRICK_TOP = FIELD.top + 80         # solo mode brick start
 BRICK_H = 22
-
-# vs-AI mode brick band sits in the middle of the field.
-AI_BRICK_ROWS = 3
-AI_BRICK_TOP = FIELD.centery - (AI_BRICK_ROWS * (BRICK_H + BRICK_GAP)) // 2
 
 EXTRA_BALL_EVERY = 100
 MAX_BALLS = 5
@@ -135,12 +135,19 @@ class Paddle:
 
 
 class AIPaddle:
-    """Top paddle controlled by a perfect predictor. Never misses."""
+    """Top paddle controlled by a perfect predictor. Never misses.
 
-    def __init__(self, y):
+    Aiming strategy: instead of meeting the ball at paddle center
+    (which makes the 5-zone reflector send it back near-vertical), the
+    AI offsets itself so the ball lands in an edge zone of the paddle,
+    producing a steep bounce. It picks the side away from the player
+    so the player has to chase across the field."""
+
+    def __init__(self, y, player=None):
         self.x = FIELD.centerx - PADDLE_W * 0.5
         self.y = y
         self.target_x = self.x
+        self.player = player    # Paddle reference for aim-away logic
 
     @property
     def rect(self):
@@ -180,13 +187,22 @@ class AIPaddle:
             rel = period - rel
         x_land = FIELD.left + rel
 
-        # Add deterministic-but-varying offset so reflections aren't
-        # straight back. We bias toward the side opposite to the ball's
-        # vx so the rally drifts.
-        offset = AI_RETURN_JITTER * (PADDLE_W * 0.5)
-        x_land -= math.copysign(offset, threat.vx)
+        # Decide which direction to send the ball. We aim away from the
+        # player's current paddle x so the player has to chase.
+        player_cx = (self.player.x + PADDLE_W * 0.5
+                     if self.player is not None else FIELD.centerx)
+        send_right = player_cx < FIELD.centerx
 
-        self.target_x = x_land - PADDLE_W * 0.5
+        # In the 5-zone reflector, hitting the ball with the paddle's
+        # right edge produces a +vx bounce (ball heads right). To send
+        # the ball right we therefore want the ball to land on the
+        # right side of the paddle, i.e. paddle center is offset to
+        # the LEFT of x_land by AI_AIM_OFFSET * (PADDLE_W/2).
+        contact = AI_AIM_OFFSET * (PADDLE_W * 0.5)
+        if send_right:
+            self.target_x = x_land - PADDLE_W * 0.5 - contact
+        else:
+            self.target_x = x_land - PADDLE_W * 0.5 + contact
 
     def update(self, dt, balls):
         self.think(balls)
@@ -303,9 +319,10 @@ class Game:
     def __init__(self, mode="solo"):
         self.mode = mode
         self.paddle = Paddle(PADDLE_Y)
-        self.ai = AIPaddle(AI_PADDLE_Y) if mode == "ai" else None
+        self.ai = AIPaddle(AI_PADDLE_Y, player=self.paddle) if mode == "ai" else None
         if mode == "ai":
-            self.bricks = make_bricks(rows=AI_BRICK_ROWS, top=AI_BRICK_TOP)
+            # vs-AI is a pure rally; no bricks in the middle.
+            self.bricks = []
         else:
             self.bricks = make_bricks()
         self.balls = []
@@ -406,12 +423,10 @@ class Game:
 
         self.balls = [b for b in self.balls if b.alive]
 
-        # Brick wall regenerates when cleared.
-        if not any(br.alive for br in self.bricks):
-            if self.mode == "ai":
-                self.bricks = make_bricks(rows=AI_BRICK_ROWS, top=AI_BRICK_TOP)
-            else:
-                self.bricks = make_bricks()
+        # Brick wall regenerates when cleared (solo mode only; vs-AI
+        # has no bricks).
+        if self.mode == "solo" and not any(br.alive for br in self.bricks):
+            self.bricks = make_bricks()
 
     def _handle_collisions(self, b):
         # Side walls always reflect.

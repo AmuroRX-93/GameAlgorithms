@@ -13,10 +13,11 @@ and CRT scanlines + bloom for that arcade-monitor look.
 ### 2. vs AI (survival)
 Classic Pong layout. The AI sits at the top and **never misses** —
 it predicts the ball's landing point including wall reflections,
-slides to meet it, and adds a small return offset so the rally
-keeps shifting. Your goal is to **stay alive as long as possible**:
-score grows with every second you survive, every ball you return,
-and every brick you smash in the middle band. One miss = game over.
+slides to meet it, and aims its paddle so the ball lands in an edge
+zone (steep ±60° bounce) on the side away from you. Your goal is to
+**stay alive as long as possible**: score grows with every second
+you survive and every ball you return. One miss = game over. No
+bricks — just a pure rally against a perfect opponent.
 
 ## Run
 
@@ -52,16 +53,20 @@ python pong.py
 
 - **Two modes**, picked from the menu (`1` solo, `2` vs AI).
 - **Perfect AI opponent.** In vs-AI mode the top paddle simulates an
-  unbeatable ghost: it predicts where the ball will arrive at its
-  y-plane (mirroring x against the side walls so reflections are
-  baked in), then glides toward that target at a high cap. To keep
-  the game interesting, returns are biased away from straight-back
-  by `AI_RETURN_JITTER`, so the rally drifts every bounce.
+  unbeatable ghost. (1) It predicts where the ball will arrive at
+  its y-plane, mirroring x against the side walls so wall
+  reflections are baked into the target. (2) It chooses *which side*
+  of itself the ball should hit by looking at the player's current
+  x: it always sends the ball to the side opposite the player. (3)
+  It places the contact point in the paddle's edge zone
+  (`AI_AIM_OFFSET = 0.85` of half-paddle), so the 5-zone reflector
+  fires the ball back at the steepest ±60° bounce. The result: the
+  player has to chase corner to corner.
 - **Survival scoring.** vs-AI mode awards 5 points/sec just for
   staying alive, plus 10 per AI return and 5 per player return.
-  Bricks pay normally.
-- **Bricks.** Solo mode has a full 5×12 wall up top; vs-AI mode has
-  a 3×12 band in the middle that both players can smash through.
+- **Bricks** (solo only). A 5×12 wall up top; smashing them all
+  spawns a fresh wall (endless mode). vs-AI is a pure rally with no
+  bricks.
 - **Multi-ball** (solo only). Every 100 points spawns a new ball
   mid-flight, up to 5 active.
 - **Sub-stepping.** Fast balls advance in up to 4 sub-steps per
@@ -74,9 +79,9 @@ python pong.py
 ## Tuning
 
 All knobs live as constants near the top of `pong.py`:
-`PADDLE_W`, `PADDLE_SPEED`, `AI_PADDLE_SPEED`, `AI_RETURN_JITTER`,
+`PADDLE_W`, `PADDLE_SPEED`, `AI_PADDLE_SPEED`, `AI_AIM_OFFSET`,
 `AI_SURVIVAL_PER_SEC`, `AI_RETURN_BONUS`, `BALL_SPEED_START`,
 `BALL_SPEED_MAX`, `BALL_SPEEDUP`, `BRICK_ROWS`, `BRICK_COLS`,
-`AI_BRICK_ROWS`, `EXTRA_BALL_EVERY`, `MAX_BALLS`. The 5-zone
-reflection lives in `reflect_off_paddle`; the AI's prediction lives
-in `AIPaddle.think`.
+`EXTRA_BALL_EVERY`, `MAX_BALLS`. The 5-zone reflection lives in
+`reflect_off_paddle`; the AI's prediction and aiming live in
+`AIPaddle.think`.
