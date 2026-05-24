@@ -270,6 +270,7 @@ class AIPaddle:
         key = (id(threat), threat.vy > 0)
         if key != self._aim_key:
             brick_bonus = [0.0] * PADDLE_ZONES
+            zone_hit_t = [None] * PADDLE_ZONES
             if use_brick_aim:
                 alive_bricks = [br for br in bricks if br.alive]
                 if alive_bricks:
@@ -287,40 +288,48 @@ class AIPaddle:
                             x_contact, contact_y, vx_out, vy_out,
                             alive_bricks,
                         )
+                        zone_hit_t[zi] = hit_t
                         if hit_t is not None:
                             # Earlier hits get a bigger bonus.
                             brick_bonus[zi] = sparsity * (1.5 + 1.0 / max(hit_t, 0.05))
 
             max_d = max(dists) or 1.0
-            # Two-tier randomness to defeat dead-loops:
-            #   30% of the time pick a fully random zone, ignoring
-            #   distance, so the trajectory takes a real detour.
-            #   The remaining 70% sample from a softmax-ish weighting
-            #   that prefers the farthest zones but keeps every zone
-            #   reachable. The combination guarantees the rally never
-            #   settles into a 2- or 4-cycle the way a strict argmax
-            #   does.
-            #
-            # In Solo demo with sparse bricks, brick_bonus dominates
-            # so the AI actively works the remaining targets instead
-            # of bouncing randomly.
-            rand_chance = 0.05 if use_brick_aim and any(brick_bonus) else 0.30
-            if random.random() < rand_chance:
-                chosen = random.randrange(PADDLE_ZONES)
+            # In AI Solo demo we have no opponent and we want every
+            # shot to land a brick (direct or after wall-banks).
+            # When at least one zone produces a hit, pick the
+            # earliest-hitting zone deterministically. No sampling,
+            # no random override -- 100% accuracy is the whole point
+            # of a "demo".
+            if (use_brick_aim
+                    and any(t is not None for t in zone_hit_t)):
+                best = None
+                best_t = float("inf")
+                for zi, t in enumerate(zone_hit_t):
+                    if t is not None and t < best_t:
+                        best_t = t
+                        best = zi
+                chosen = best
             else:
-                weights = [
-                    (d / max_d) ** 2 + 0.18 + brick_bonus[i]
-                    for i, d in enumerate(dists)
-                ]
-                total = sum(weights)
-                r = random.random() * total
-                acc = 0.0
-                chosen = 0
-                for i, w in enumerate(weights):
-                    acc += w
-                    if r <= acc:
-                        chosen = i
-                        break
+                # Two-tier randomness to defeat dead-loops in modes
+                # without a deterministic target (AI vs AI demo, or
+                # vs human). 30% pure random zone, 70% weighted
+                # sample over farthest-from-opponent zones.
+                if random.random() < 0.30:
+                    chosen = random.randrange(PADDLE_ZONES)
+                else:
+                    weights = [
+                        (d / max_d) ** 2 + 0.18 + brick_bonus[i]
+                        for i, d in enumerate(dists)
+                    ]
+                    total = sum(weights)
+                    r = random.random() * total
+                    acc = 0.0
+                    chosen = 0
+                    for i, w in enumerate(weights):
+                        acc += w
+                        if r <= acc:
+                            chosen = i
+                            break
             self._aim_key = key
             self._aim_zone = chosen
 
@@ -684,13 +693,19 @@ class Game:
                 self.lose_ball(b)
                 return
 
-        # Player paddle. In demo mode the bottom paddle is AI-driven,
-        # so apply the same reflection-angle jitter.
+        # Player paddle. In AI-vs-AI demo the bottom paddle is also
+        # AI-driven and needs reflection jitter to break the
+        # mirrored-AI dead-loop; in AI Solo demo we want the
+        # opposite -- exact reflections so the brick-aim raycast is
+        # 100% accurate. Human play uses no jitter either way.
         prect = self.paddle.rect
         hit, nx, ny, pdx, pdy = aabb_circle_collision(prect, b.x, b.y, BALL_R)
         if hit and b.vy > 0:
             b.x += pdx; b.y += pdy
-            jitter = AI_ANGLE_JITTER if self.demo else 0.0
+            if self.demo and self.mode == "ai":
+                jitter = AI_ANGLE_JITTER
+            else:
+                jitter = 0.0
             reflect_off_paddle(b, self.paddle, downward=False,
                                angle_jitter=jitter)
             self.flash_timer = 0.12
