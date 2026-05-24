@@ -127,6 +127,19 @@ class Paddle:
             self.x += (target - self.x) * min(1.0, dt * 18)
         self.x = max(FIELD.left, min(FIELD.right - PADDLE_W, self.x))
 
+    def auto_update(self, dt, target_center_x, max_speed=PADDLE_SPEED):
+        """Demo / AI-driven move: glide toward target_center_x at the
+        given speed cap. Used in demo modes."""
+        target = target_center_x - PADDLE_W * 0.5
+        diff = target - self.x
+        step = max_speed * dt
+        if diff > step:
+            diff = step
+        elif diff < -step:
+            diff = -step
+        self.x += diff
+        self.x = max(FIELD.left, min(FIELD.right - PADDLE_W, self.x))
+
     def notice_mouse_move(self, mouse_pos):
         self.use_mouse = True
 
@@ -140,31 +153,44 @@ class AIPaddle:
     producing a steep bounce. It picks the side away from the player
     so the player has to chase across the field."""
 
-    def __init__(self, y, player=None):
+    def __init__(self, y, player=None, bottom=False):
         self.x = FIELD.centerx - PADDLE_W * 0.5
         self.y = y
         self.target_x = self.x
-        self.player = player    # Paddle reference for aim-away logic
+        self.player = player    # opposing paddle (for aim-away logic)
+        self.bottom = bottom    # True for the bottom paddle in demo mode
 
     @property
     def rect(self):
         return pygame.Rect(int(self.x), int(self.y), PADDLE_W, PADDLE_H)
 
-    def think(self, balls):
+    def think(self, balls, opponent_y=None):
         """For each incoming ball, plan a return that maximizes the
-        distance between the ball's eventual x at the player's paddle
-        plane and the player's current x. We enumerate the 5 reflection
-        zones, simulate the resulting trajectory (including side-wall
-        reflections via mirror folding), and pick the zone with the
-        farthest landing offset from the player. Then we set our paddle
-        target so the ball will hit that exact zone."""
-        # Find the most threatening incoming ball (smallest time-to-arrival).
+        distance between the ball's eventual x at the opposing paddle
+        plane and the opposing paddle's current x. We enumerate the 5
+        reflection zones, simulate the resulting trajectory (including
+        side-wall reflections via mirror folding), and pick the zone
+        with the farthest landing offset from the opponent.
+
+        For the top AI (default, bottom=False) incoming balls have
+        vy < 0 and the contact happens at self.y + PADDLE_H. For the
+        bottom AI (bottom=True) it's the mirror: incoming have vy > 0
+        and contact happens at self.y."""
+        if self.bottom:
+            contact_y = self.y
+            incoming_sign = +1   # vy > 0 means heading toward us
+        else:
+            contact_y = self.y + PADDLE_H
+            incoming_sign = -1   # vy < 0 means heading toward us
+
         threat = None
         best_t = float("inf")
         for b in balls:
-            if not b.alive or b.vy >= 0:
+            if not b.alive:
                 continue
-            t = (self.y + PADDLE_H - b.y) / b.vy
+            if incoming_sign * b.vy <= 0:
+                continue
+            t = (contact_y - b.y) / b.vy
             if t < 0:
                 continue
             if t < best_t:
@@ -174,42 +200,44 @@ class AIPaddle:
             self.target_x = FIELD.centerx - PADDLE_W * 0.5
             return
 
-        # 1) Where will the ball cross our paddle plane (with wall
-        # reflections folded in)? This is also where the contact point
-        # will be on our paddle along x.
         x_contact = _fold_into_field(threat.x + threat.vx * best_t)
 
-        # 2) Player's current center.
-        player_cx = (self.player.x + PADDLE_W * 0.5
-                     if self.player is not None else FIELD.centerx)
+        # Opponent's current center, defaults to field center when no
+        # opponent is set (e.g. solo demo: just keep ball in play).
+        if self.player is not None:
+            player_cx = self.player.x + PADDLE_W * 0.5
+        else:
+            player_cx = FIELD.centerx
 
-        # 3) Simulate each of the 5 zones and pick the one whose
-        # outgoing ball reaches the player plane farthest from the
-        # player's current x. The zone we pick determines the contact
-        # offset on our paddle, which in turn pins down our target_x.
         out_speed = min(BALL_SPEED_MAX, threat.speed * BALL_SPEEDUP)
-        dy = PADDLE_Y - (self.y + PADDLE_H)   # vertical distance to player plane
+        # Vertical distance to opponent's plane (positive number).
+        if opponent_y is not None:
+            target_y = opponent_y
+        elif self.player is not None:
+            target_y = self.player.y
+        else:
+            # Solo demo: aim for top wall plane (just keep angles wild).
+            target_y = FIELD.top
+        dy = abs(target_y - contact_y)
         half = (PADDLE_ZONES - 1) * 0.5
 
         best_zone = 0
         best_dist = -1.0
         for zone in range(PADDLE_ZONES):
-            t_zone = (zone - half) / half       # -1..+1
+            t_zone = (zone - half) / half
             angle = math.radians(60.0) * t_zone
             vx_out = math.sin(angle) * out_speed
-            vy_out = math.cos(angle) * out_speed   # downward, > 0
-            # Time for ball to reach player plane.
-            travel_t = dy / max(vy_out, 1e-3)
+            # Outgoing vy points away from us. For top AI that's down
+            # (positive); for bottom AI that's up (negative). Magnitude
+            # is the same.
+            vy_mag = math.cos(angle) * out_speed
+            travel_t = dy / max(vy_mag, 1e-3)
             x_arrive = _fold_into_field(x_contact + vx_out * travel_t)
             dist = abs(x_arrive - player_cx)
             if dist > best_dist:
                 best_dist = dist
                 best_zone = zone
 
-        # 4) Place our paddle so the ball lands in the chosen zone.
-        # zone is determined by rel = (ball_x - paddle_x) / PADDLE_W
-        # bucketed into 5 slots. We aim the ball at the *center* of the
-        # chosen zone so it doesn't slip into a neighbor under noise.
         zone_center_rel = (best_zone + 0.5) / PADDLE_ZONES
         self.target_x = x_contact - zone_center_rel * PADDLE_W
 
@@ -337,14 +365,32 @@ def aabb_circle_collision(rect, x, y, r):
 
 class Game:
     """One Game instance can run either gameplay mode. mode is "solo"
-    or "ai"; we branch on it for layout, scoring, and update rules."""
+    or "ai"; we branch on it for layout, scoring, and update rules.
+    demo=True replaces human input with an automated player so the
+    game becomes a self-running showcase."""
 
-    def __init__(self, mode="solo"):
+    def __init__(self, mode="solo", demo=False):
         self.mode = mode
+        self.demo = demo
         self.paddle = Paddle(PADDLE_Y)
+        # In vs-AI gameplay the AI sits up top. In ai-vs-ai demo we
+        # also need a TOP AI; in solo demo there's no AI opponent.
         self.ai = AIPaddle(AI_PADDLE_Y, player=self.paddle) if mode == "ai" else None
+        # Demo controller for the bottom paddle: a separate AIPaddle
+        # whose y is PADDLE_Y. It plans the same way the top AI does
+        # (predicts arrival, picks a zone). For solo demo the player
+        # AI doesn't need an opponent to aim at, but it still benefits
+        # from prediction; we'll point its "player" reference at None
+        # so it just centers its target on the predicted arrival.
+        self.player_ai = None
+        if demo:
+            opponent = self.ai          # may be None (solo demo)
+            self.player_ai = AIPaddle(PADDLE_Y, player=opponent)
+            # The bottom AI bounces the ball UP, so we need to flip its
+            # contact-vs-arrival math. We mark it as 'bottom' so think()
+            # treats vy < 0 (away) and vy > 0 (incoming) inverted.
+            self.player_ai.bottom = True
         if mode == "ai":
-            # vs-AI is a pure rally; no bricks in the middle.
             self.bricks = []
         else:
             self.bricks = make_bricks()
@@ -353,11 +399,11 @@ class Game:
         self.next_extra_at = EXTRA_BALL_EVERY
         self.lives = 3 if mode == "solo" else 1
         self.state = "ready"
-        self.flash_timer = 0.0       # player paddle flash
+        self.flash_timer = 0.0
         self.ai_flash_timer = 0.0
         self.shake = 0.0
-        self.elapsed = 0.0           # seconds survived (vs-AI mode)
-        self.score_accum = 0.0       # fractional survival score carry
+        self.elapsed = 0.0
+        self.score_accum = 0.0
 
     # ----- Ball spawning -----------------------------------------------
 
@@ -386,7 +432,7 @@ class Game:
     # ----- Game flow ----------------------------------------------------
 
     def reset(self):
-        self.__init__(mode=self.mode)
+        self.__init__(mode=self.mode, demo=self.demo)
         self.attach_ball_to_paddle()
 
     def lose_ball(self, b):
@@ -394,7 +440,18 @@ class Game:
         if all(not bb.alive for bb in self.balls):
             self.lives -= 1
             if self.lives <= 0:
-                self.state = "gameover"
+                if self.demo:
+                    # Demo never ends; just respawn.
+                    self.lives = 3 if self.mode == "solo" else 1
+                    self.score = 0
+                    self.elapsed = 0.0
+                    self.score_accum = 0.0
+                    self.state = "ready"
+                    if self.mode == "solo":
+                        self.bricks = make_bricks()
+                    self.attach_ball_to_paddle()
+                else:
+                    self.state = "gameover"
             else:
                 self.state = "ready"
                 self.attach_ball_to_paddle()
@@ -412,7 +469,16 @@ class Game:
         self.ai_flash_timer = max(0.0, self.ai_flash_timer - dt)
         self.shake = max(0.0, self.shake - dt * 8)
 
-        self.paddle.update(dt, keys, mouse_pos)
+        if self.demo and self.player_ai is not None:
+            # Demo: bottom paddle is AI-driven. Use the same predictor
+            # but ignore keyboard / mouse. think() computes a target_x
+            # in screen coordinates; we then move the actual paddle
+            # toward it at the AI speed cap.
+            self.player_ai.think(self.balls)
+            self.paddle.auto_update(dt, self.player_ai.target_x + PADDLE_W * 0.5,
+                                    max_speed=AI_PADDLE_SPEED)
+        else:
+            self.paddle.update(dt, keys, mouse_pos)
         if self.ai is not None:
             self.ai.update(dt, self.balls)
 
@@ -422,6 +488,10 @@ class Game:
                     if b.vx == 0 and b.vy == 0:
                         b.x = self.paddle.x + PADDLE_W * 0.5
                         b.y = self.paddle.y - BALL_R - 1
+                # Demo: auto-launch the pinned ball.
+                if self.demo:
+                    self.state = "playing"
+                    self.launch_pinned_ball()
             return
 
         # Survival score in vs-AI mode.
@@ -623,21 +693,33 @@ def draw_overlay_text(screen, font_big, font_small, game):
 
 def draw_menu(screen, font_big, font_med, font_small):
     title = font_big.render("PONG", True, ACCENT)
-    screen.blit(title, title.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 120)))
+    screen.blit(title, title.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 160)))
 
     sub = font_med.render("Choose a mode", True, TEXT_DIM)
-    screen.blit(sub, sub.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 60)))
+    screen.blit(sub, sub.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 100)))
 
     opt1 = font_med.render("[1]  SOLO  -  bricks, multi-ball, 3 lives",
                            True, TEXT)
-    screen.blit(opt1, opt1.get_rect(center=(WIDTH // 2, HEIGHT // 2)))
+    screen.blit(opt1, opt1.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 40)))
 
     opt2 = font_med.render("[2]  vs AI  -  survive a perfect opponent",
                            True, AI_PADDLE_COL)
-    screen.blit(opt2, opt2.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 36)))
+    screen.blit(opt2, opt2.get_rect(center=(WIDTH // 2, HEIGHT // 2)))
+
+    demo_label = font_med.render("Demos", True, TEXT_DIM)
+    screen.blit(demo_label, demo_label.get_rect(
+        center=(WIDTH // 2, HEIGHT // 2 + 50)))
+
+    opt3 = font_med.render("[3]  AI  vs  AI  -  watch them rally forever",
+                           True, ACCENT)
+    screen.blit(opt3, opt3.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 86)))
+
+    opt4 = font_med.render("[4]  AI  Solo  -  watch a perfect bricks run",
+                           True, ACCENT)
+    screen.blit(opt4, opt4.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 118)))
 
     foot = font_small.render("Esc to quit.", True, TEXT_DIM)
-    screen.blit(foot, foot.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 100)))
+    screen.blit(foot, foot.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 170)))
 
 
 def draw_scanlines(screen):
@@ -659,6 +741,25 @@ def draw_glow(screen):
 # ---------------------------------------------------------------------------
 
 
+def _menu_button_rect():
+    """Bounding box of the 'MENU' UI button drawn inside the play field
+    (placed below the HUD row so it doesn't overlap LIVES/BALLS/TIME)."""
+    return pygame.Rect(FIELD.left + 8, FIELD.top + 44, 76, 24)
+
+
+def draw_menu_button(screen, font_small, hover):
+    """A small clickable MENU button shown during gameplay."""
+    rect = _menu_button_rect()
+    border = ACCENT if hover else BEZEL_LINE
+    surf = pygame.Surface(rect.size, pygame.SRCALPHA)
+    pygame.draw.rect(surf, (28, 32, 50, 200), surf.get_rect(),
+                     border_radius=4)
+    pygame.draw.rect(surf, border, surf.get_rect(), 1, border_radius=4)
+    screen.blit(surf, rect.topleft)
+    label = font_small.render("MENU", True, TEXT if hover else TEXT_DIM)
+    screen.blit(label, label.get_rect(center=rect.center))
+
+
 def main():
     pygame.init()
     pygame.display.set_caption("Pong")
@@ -668,17 +769,27 @@ def main():
     font_med = pygame.font.SysFont("Menlo,Consolas,monospace", 18, bold=True)
     font_small = pygame.font.SysFont("Menlo,Consolas,monospace", 12)
 
-    pygame.mouse.set_visible(False)
+    pygame.mouse.set_visible(True)
 
     # Top-level scene: "menu" or "play".
     scene = "menu"
     game = None
+
+    def start(mode, demo=False):
+        g = Game(mode=mode, demo=demo)
+        g.attach_ball_to_paddle()
+        return g
 
     while True:
         dt_ms = clock.tick(FPS)
         dt = min(1.0 / 30.0, dt_ms / 1000.0)
         keys = pygame.key.get_pressed()
         mouse_pos = pygame.mouse.get_pos()
+
+        # Reusable hover test for the MENU button.
+        menu_btn_rect = _menu_button_rect()
+        menu_btn_hover = (scene == "play"
+                          and menu_btn_rect.collidepoint(mouse_pos))
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -688,15 +799,21 @@ def main():
                     pygame.quit(); sys.exit(0)
                 if scene == "menu":
                     if event.key == pygame.K_1:
-                        game = Game(mode="solo")
-                        game.attach_ball_to_paddle()
+                        game = start("solo")
                         scene = "play"
                     elif event.key == pygame.K_2:
-                        game = Game(mode="ai")
-                        game.attach_ball_to_paddle()
+                        game = start("ai")
+                        scene = "play"
+                    elif event.key == pygame.K_3:
+                        # AI vs AI demo.
+                        game = start("ai", demo=True)
+                        scene = "play"
+                    elif event.key == pygame.K_4:
+                        # AI plays solo demo.
+                        game = start("solo", demo=True)
                         scene = "play"
                 else:
-                    if event.key == pygame.K_SPACE:
+                    if event.key == pygame.K_SPACE and not game.demo:
                         if game.state == "ready":
                             game.state = "playing"
                             game.launch_pinned_ball()
@@ -710,8 +827,12 @@ def main():
                     elif event.key == pygame.K_m:
                         scene = "menu"
                         game = None
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if scene == "play" and menu_btn_rect.collidepoint(event.pos):
+                    scene = "menu"
+                    game = None
             elif event.type == pygame.MOUSEMOTION:
-                if scene == "play" and game is not None:
+                if scene == "play" and game is not None and not game.demo:
                     game.paddle.notice_mouse_move(mouse_pos)
 
         # ---- Render -----------------------------------------------------
@@ -735,8 +856,14 @@ def main():
             layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
             draw_field(layer)
             draw_bricks(layer, game.bricks)
+            # In demos we color the bottom paddle red too, to signal it
+            # isn't player-controlled.
+            if game.demo:
+                bot_col, bot_glow = AI_PADDLE_COL, AI_PADDLE_GLOW
+            else:
+                bot_col, bot_glow = PADDLE_COL, PADDLE_GLOW
             draw_paddle(layer, game.paddle, game.flash_timer,
-                        color=PADDLE_COL, glow_color=PADDLE_GLOW)
+                        color=bot_col, glow_color=bot_glow)
             if game.ai is not None:
                 draw_paddle(layer, game.ai, game.ai_flash_timer,
                             color=AI_PADDLE_COL, glow_color=AI_PADDLE_GLOW)
@@ -747,6 +874,7 @@ def main():
 
             draw_hud(screen, font_med, font_small, game)
             draw_overlay_text(screen, font_big, font_small, game)
+            draw_menu_button(screen, font_small, menu_btn_hover)
 
         draw_glow(screen)
         draw_scanlines(screen)

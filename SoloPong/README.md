@@ -1,6 +1,6 @@
 # Pong
 
-Two flavors in one binary, picked from the start menu.
+Four flavors in one binary, picked from the start menu.
 
 ## Modes
 
@@ -19,6 +19,17 @@ zone (steep ±60° bounce) on the side away from you. Your goal is to
 you survive and every ball you return. One miss = game over. No
 bricks — just a pure rally against a perfect opponent.
 
+### 3. AI vs AI (demo)
+Both paddles are driven by the same predictor and play each other.
+Watch them rally forever. Useful for tuning AI parameters or just
+zoning out.
+
+### 4. AI Solo (demo)
+The AI controls the bottom paddle in solo mode and demolishes the
+brick wall on its own. Multi-ball and screen shake included; the
+demo never ends (the AI auto-resets when it eventually drops a
+ball).
+
 ## Run
 
 ```bash
@@ -29,12 +40,13 @@ python pong.py
 
 ## Controls
 
-- **1 / 2** — pick a mode at the menu
+- **1 / 2 / 3 / 4** — pick a mode at the menu
 - **Mouse** — paddle follows the cursor
 - **Left / Right** or **A / D** — keyboard control
-- **Space** — launch ball / pause / resume
+- **Space** — launch ball / pause / resume (manual modes only)
 - **R** — restart after game over
 - **M** — back to mode menu
+- **MENU button** (top-left of the field) — same as `M`
 - **Esc** — quit
 
 ## What's faithful to the original
