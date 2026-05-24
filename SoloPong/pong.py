@@ -24,6 +24,7 @@ Controls:
   - Esc - quit
 """
 
+import asyncio
 import math
 import random
 import sys
@@ -927,7 +928,7 @@ def draw_menu_button(screen, font_small, hover):
     screen.blit(label, label.get_rect(center=rect.center))
 
 
-def main():
+async def main():
     pygame.init()
     pygame.display.set_caption("Pong")
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -947,7 +948,8 @@ def main():
         g.attach_ball_to_paddle()
         return g
 
-    while True:
+    running = True
+    while running:
         dt_ms = clock.tick(FPS)
         dt = min(1.0 / 30.0, dt_ms / 1000.0)
         keys = pygame.key.get_pressed()
@@ -960,11 +962,17 @@ def main():
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                pygame.quit(); sys.exit(0)
+                running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    pygame.quit(); sys.exit(0)
-                if scene == "menu":
+                    # In the browser there's no real "quit"; just go
+                    # back to the menu.
+                    if scene == "play":
+                        scene = "menu"
+                        game = None
+                    else:
+                        running = False
+                elif scene == "menu":
                     if event.key == pygame.K_1:
                         game = start("solo")
                         scene = "play"
@@ -1047,7 +1055,12 @@ def main():
         draw_scanlines(screen)
 
         pygame.display.flip()
+        # Yield to the browser event loop. Required by pygbag /
+        # Pyodide; on desktop it just sleeps for 0s.
+        await asyncio.sleep(0)
+
+    pygame.quit()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
