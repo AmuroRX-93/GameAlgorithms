@@ -173,7 +173,7 @@ class AIPaddle:
     def rect(self):
         return pygame.Rect(int(self.x), int(self.y), PADDLE_W, PADDLE_H)
 
-    def think(self, balls, opponent_y=None):
+    def think(self, balls, opponent_y=None, bricks=None):
         """For each incoming ball, plan a return that maximizes the
         distance between the ball's eventual x at the opposing paddle
         plane and the opposing paddle's current x. We enumerate the 5
@@ -184,7 +184,12 @@ class AIPaddle:
         For the top AI (default, bottom=False) incoming balls have
         vy < 0 and the contact happens at self.y + PADDLE_H. For the
         bottom AI (bottom=True) it's the mirror: incoming have vy > 0
-        and contact happens at self.y."""
+        and contact happens at self.y.
+
+        If `bricks` is provided and we have no opposing paddle (Solo
+        demo), the score also includes whether the trajectory will
+        actually hit a brick, biasing the AI toward productive
+        offensive shots when only a few bricks are left."""
         if self.bottom:
             contact_y = self.y
             incoming_sign = +1   # vy > 0 means heading toward us
@@ -235,6 +240,7 @@ class AIPaddle:
         # symmetry that produces dead-loop rallies in AI vs AI demos,
         # and keeps the human-vs-AI mode from feeling robotic.
         dists = []
+        zone_vels = []
         for zone in range(PADDLE_ZONES):
             t_zone = (zone - half) / half
             angle = math.radians(60.0) * t_zone
@@ -243,12 +249,43 @@ class AIPaddle:
             travel_t = dy / max(vy_mag, 1e-3)
             x_arrive = _fold_into_field(x_contact + vx_out * travel_t)
             dists.append(abs(x_arrive - player_cx))
+            # Outgoing vy is "away from us": top AI bounces down (+),
+            # bottom AI bounces up (-).
+            vy_out = vy_mag if self.bottom else -vy_mag
+            zone_vels.append((vx_out, vy_out))
+
+        # Solo-demo brick-targeting bonus: when there's no opposing
+        # paddle and bricks remain, prefer zones whose trajectory
+        # actually hits a brick. Bias scales with sparsity, so in a
+        # full layout the AI still shoots loosely, and as the field
+        # empties it works the leftovers.
+        use_brick_aim = (
+            self.player is None and bricks
+            and self.bottom  # only the demo's bottom paddle
+        )
 
         # Resample only when this is a new rally (different ball or
         # the ball's vy flipped sign), so the paddle commits to one
         # aim and doesn't twitch every frame.
         key = (id(threat), threat.vy > 0)
         if key != self._aim_key:
+            brick_bonus = [0.0] * PADDLE_ZONES
+            if use_brick_aim:
+                alive_bricks = [br for br in bricks if br.alive]
+                if alive_bricks:
+                    # Sparsity factor: 0 when full (>=24 bricks),
+                    # 1 when nearly empty (<=4). Lerp linearly.
+                    n = len(alive_bricks)
+                    sparsity = max(0.0, min(1.0, (24 - n) / 20.0))
+                    for zi, (vx_out, vy_out) in enumerate(zone_vels):
+                        hit_t = _raycast_first_brick_hit(
+                            x_contact, contact_y, vx_out, vy_out,
+                            alive_bricks,
+                        )
+                        if hit_t is not None:
+                            # Earlier hits get a bigger bonus.
+                            brick_bonus[zi] = sparsity * (1.5 + 1.0 / max(hit_t, 0.05))
+
             max_d = max(dists) or 1.0
             # Two-tier randomness to defeat dead-loops:
             #   30% of the time pick a fully random zone, ignoring
@@ -258,10 +295,18 @@ class AIPaddle:
             #   reachable. The combination guarantees the rally never
             #   settles into a 2- or 4-cycle the way a strict argmax
             #   does.
-            if random.random() < 0.30:
+            #
+            # In Solo demo with sparse bricks, brick_bonus dominates
+            # so the AI actively works the remaining targets instead
+            # of bouncing randomly.
+            rand_chance = 0.05 if use_brick_aim and any(brick_bonus) else 0.30
+            if random.random() < rand_chance:
                 chosen = random.randrange(PADDLE_ZONES)
             else:
-                weights = [(d / max_d) ** 2 + 0.18 for d in dists]
+                weights = [
+                    (d / max_d) ** 2 + 0.18 + brick_bonus[i]
+                    for i, d in enumerate(dists)
+                ]
                 total = sum(weights)
                 r = random.random() * total
                 acc = 0.0
@@ -335,6 +380,37 @@ def _fold_into_field(x):
     if rel > span:
         rel = period - rel
     return FIELD.left + rel
+
+
+def _raycast_first_brick_hit(x0, y0, vx, vy, alive_bricks, max_t=2.5):
+    """Simulate a free-flying ball from (x0, y0) with velocity (vx, vy),
+    bouncing off the side walls and the top wall, until it hits any
+    alive brick or `max_t` seconds elapse. Returns the elapsed time on
+    impact, or None if no brick is hit. Used by the AI Solo demo to
+    pick reflection zones whose trajectory actually clears bricks."""
+    if vy == 0:
+        return None
+    x, y = x0, y0
+    t = 0.0
+    dt = 1.0 / 120.0  # finer than render dt; we're doing maybe ~300 steps total
+    while t < max_t:
+        x += vx * dt
+        y += vy * dt
+        t += dt
+        # Reflect off side walls.
+        if x < FIELD.left:
+            x = 2 * FIELD.left - x
+            vx = -vx
+        elif x > FIELD.right:
+            x = 2 * FIELD.right - x
+            vx = -vx
+        # Stop when leaving the playable area at top/bottom.
+        if y < FIELD.top or y > FIELD.bottom:
+            return None
+        for br in alive_bricks:
+            if br.rect.collidepoint(x, y):
+                return t
+    return None
 
 
 def make_bricks(rows=BRICK_ROWS, top=BRICK_TOP):
@@ -527,7 +603,7 @@ class Game:
             # but ignore keyboard / mouse. think() computes a target_x
             # in screen coordinates; we then move the actual paddle
             # toward it at the AI speed cap.
-            self.player_ai.think(self.balls)
+            self.player_ai.think(self.balls, bricks=self.bricks)
             self.paddle.auto_update(dt, self.player_ai.target_x + PADDLE_W * 0.5,
                                     max_speed=AI_PADDLE_SPEED)
         else:
