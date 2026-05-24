@@ -1,25 +1,27 @@
 """
-Single-player Pong, in the spirit of Atari's 1972 original but with the
-opponent replaced by the top wall. The ball bounces off the left, right,
-and top walls forever; only the bottom is lethal. The paddle is split
-into 5 zones — the further from center the ball hits, the steeper the
-bounce angle, exactly like the Atari arcade cabinet.
+Pong, two flavors in one binary.
 
-Twists added on top of plain Pong:
-  - Bricks: a wall of breakable bricks sits in the upper third. Smashing
-    a brick scores points and frees the ball back downward.
-  - Multi-ball: a new ball joins the field every 100 points, up to a cap.
-    Lose them all and it's game over.
-  - Speed-up: each paddle hit speeds the ball up a touch, capped so it
-    stays catchable.
-  - CRT post: scanlines + a soft additive glow over the play field.
+Mode 1 - Solo (Atari-style with bricks):
+  Ball bounces off the left, right, and top walls forever; only the
+  bottom is lethal. Paddle is split into 5 zones (Atari 1972 angle
+  table). Breakable bricks sit in the upper third; clear them all and
+  a fresh wall spawns. Multi-ball every 100 points (capped).
+
+Mode 2 - vs AI (survival):
+  Classic Pong layout but rotated 90deg, so paddles are horizontal
+  bars at the top (AI) and bottom (player). The AI never misses -
+  it predicts where the ball will arrive (including wall reflections)
+  and slides to meet it. Score grows with survival time and with each
+  successful return; lose when the ball passes your paddle.
 
 Controls:
-  - Left / Right arrows or A / D — move paddle
-  - Mouse — paddle follows cursor X (more precise)
-  - Space — launch the ball at the start of a life / unpause
-  - R — restart the game after game over
-  - Esc — quit
+  - Menu: 1 = Solo, 2 = vs AI
+  - Left / Right or A / D - move paddle
+  - Mouse - paddle follows cursor X
+  - Space - launch / pause / resume
+  - R - restart after game over
+  - M - back to menu
+  - Esc - quit
 """
 
 import math
@@ -34,33 +36,45 @@ import pygame
 WIDTH, HEIGHT = 960, 720
 FPS = 60
 
-# Play field bounds: a small inset from the window so the CRT bezel reads.
 FIELD_PAD = 24
 FIELD = pygame.Rect(FIELD_PAD, FIELD_PAD, WIDTH - 2 * FIELD_PAD, HEIGHT - 2 * FIELD_PAD)
 
 PADDLE_W = 110
 PADDLE_H = 14
-PADDLE_Y = FIELD.bottom - 38
-PADDLE_SPEED = 720.0     # px/s for keyboard control
-PADDLE_ZONES = 5         # 5-segment angle table (Atari style)
+PADDLE_Y = FIELD.bottom - 38       # solo / player paddle y
+AI_PADDLE_Y = FIELD.top + 24       # AI paddle y in vs-AI mode
+PADDLE_SPEED = 720.0
+PADDLE_ZONES = 5
+
+# AI tuning. The AI is intentionally fast enough to always reach its
+# target; what makes the game playable is that it adds a small return
+# wobble so the ball trajectory keeps changing.
+AI_PADDLE_SPEED = 1100.0
+AI_RETURN_JITTER = 0.18            # 0..1, fraction of paddle half used as offset
 
 BALL_R = 7
 BALL_SPEED_START = 380.0
 BALL_SPEED_MAX = 760.0
-BALL_SPEEDUP = 1.04      # multiplier per paddle hit
+BALL_SPEEDUP = 1.04
 
 BRICK_ROWS = 5
 BRICK_COLS = 12
 BRICK_GAP = 4
-BRICK_TOP = FIELD.top + 80
+BRICK_TOP = FIELD.top + 80         # solo mode brick start
 BRICK_H = 22
 
-# Score thresholds where a new ball spawns. Cap the active balls so the
-# screen doesn't turn into a snowstorm.
+# vs-AI mode brick band sits in the middle of the field.
+AI_BRICK_ROWS = 3
+AI_BRICK_TOP = FIELD.centery - (AI_BRICK_ROWS * (BRICK_H + BRICK_GAP)) // 2
+
 EXTRA_BALL_EVERY = 100
 MAX_BALLS = 5
 
-# Colors. Slightly oversaturated to play nicely with the additive glow.
+# vs-AI scoring: per-second survival reward + per-return reward.
+AI_SURVIVAL_PER_SEC = 5
+AI_RETURN_BONUS = 10
+AI_PLAYER_HIT_BONUS = 5
+
 BG          = (8, 10, 16)
 BEZEL       = (28, 32, 50)
 BEZEL_LINE  = (60, 70, 95)
@@ -68,13 +82,14 @@ FIELD_BG    = (10, 14, 22)
 FIELD_LINE  = (40, 50, 75)
 PADDLE_COL  = (180, 230, 255)
 PADDLE_GLOW = (90, 160, 220)
+AI_PADDLE_COL  = (255, 170, 170)
+AI_PADDLE_GLOW = (220, 90, 90)
 BALL_COL    = (255, 240, 200)
 TEXT        = (220, 226, 240)
 TEXT_DIM    = (140, 150, 175)
 ACCENT      = (245, 210, 80)
 GAMEOVER    = (255, 110, 110)
 
-# Per-row brick colors (rainbow-ish, like Breakout).
 BRICK_PALETTE = [
     (235,  90,  90),
     (245, 170,  80),
@@ -90,20 +105,18 @@ BRICK_PALETTE = [
 
 
 class Paddle:
-    """The player's paddle. Lives at a fixed y; x clamps to the field."""
+    """Horizontal paddle. y is fixed; x clamps to the field."""
 
-    def __init__(self):
+    def __init__(self, y):
         self.x = FIELD.centerx - PADDLE_W * 0.5
-        self.target_x = self.x   # used by mouse smoothing
+        self.y = y
         self.use_mouse = False
 
     @property
     def rect(self):
-        return pygame.Rect(int(self.x), PADDLE_Y, PADDLE_W, PADDLE_H)
+        return pygame.Rect(int(self.x), int(self.y), PADDLE_W, PADDLE_H)
 
     def update(self, dt, keys, mouse_pos):
-        # Mouse takes priority once it moves; switch back to keys when
-        # the user presses arrows/A/D.
         kb_dir = 0
         if keys[pygame.K_LEFT] or keys[pygame.K_a]:
             kb_dir -= 1
@@ -113,21 +126,82 @@ class Paddle:
             self.use_mouse = False
             self.x += kb_dir * PADDLE_SPEED * dt
         elif self.use_mouse:
-            # Snap toward the mouse with a tiny ease so it isn't jittery.
             target = mouse_pos[0] - PADDLE_W * 0.5
             self.x += (target - self.x) * min(1.0, dt * 18)
-        # Clamp within the field.
         self.x = max(FIELD.left, min(FIELD.right - PADDLE_W, self.x))
 
     def notice_mouse_move(self, mouse_pos):
-        # Called when the mouse actually moves; we switch into mouse mode.
         self.use_mouse = True
 
 
-class Ball:
-    """A round bouncing ball. Stores position as floats so collisions
-    don't suffer from integer rounding."""
+class AIPaddle:
+    """Top paddle controlled by a perfect predictor. Never misses."""
 
+    def __init__(self, y):
+        self.x = FIELD.centerx - PADDLE_W * 0.5
+        self.y = y
+        self.target_x = self.x
+
+    @property
+    def rect(self):
+        return pygame.Rect(int(self.x), int(self.y), PADDLE_W, PADDLE_H)
+
+    def think(self, balls):
+        """Pick the most-threatening ball heading up, predict its x at
+        self.y including left/right wall reflections, and aim our center
+        at that x (with a tiny deliberate offset so returns vary)."""
+        threat = None
+        best_t = float("inf")
+        for b in balls:
+            if not b.alive or b.vy >= 0:
+                continue
+            # Time until the ball center reaches our paddle plane.
+            t = (self.y + PADDLE_H - b.y) / b.vy
+            if t < 0:
+                continue
+            if t < best_t:
+                best_t = t
+                threat = b
+        if threat is None:
+            # No incoming ball: glide back to center to look ready.
+            self.target_x = FIELD.centerx - PADDLE_W * 0.5
+            return
+
+        # Predict landing x via mirror-reflection of the field width.
+        x_pred = threat.x + threat.vx * best_t
+        span = FIELD.width
+        # Map x_pred into [FIELD.left, FIELD.right] by repeated reflection.
+        rel = x_pred - FIELD.left
+        period = 2 * span
+        rel = rel % period
+        if rel < 0:
+            rel += period
+        if rel > span:
+            rel = period - rel
+        x_land = FIELD.left + rel
+
+        # Add deterministic-but-varying offset so reflections aren't
+        # straight back. We bias toward the side opposite to the ball's
+        # vx so the rally drifts.
+        offset = AI_RETURN_JITTER * (PADDLE_W * 0.5)
+        x_land -= math.copysign(offset, threat.vx)
+
+        self.target_x = x_land - PADDLE_W * 0.5
+
+    def update(self, dt, balls):
+        self.think(balls)
+        # Move toward target_x at capped speed.
+        dx = self.target_x - self.x
+        max_step = AI_PADDLE_SPEED * dt
+        if dx > max_step:
+            dx = max_step
+        elif dx < -max_step:
+            dx = -max_step
+        self.x += dx
+        self.x = max(FIELD.left, min(FIELD.right - PADDLE_W, self.x))
+
+
+class Ball:
     __slots__ = ("x", "y", "vx", "vy", "speed", "alive", "trail")
 
     def __init__(self, x, y, vx, vy, speed):
@@ -135,7 +209,6 @@ class Ball:
         self.vx = vx; self.vy = vy
         self.speed = speed
         self.alive = True
-        # Recent positions for a short motion trail.
         self.trail = []
 
     def step(self, dt):
@@ -161,48 +234,39 @@ class Brick:
 # ---------------------------------------------------------------------------
 
 
-def make_bricks():
-    """Lay out a grid of bricks. Returns a list of Brick."""
+def make_bricks(rows=BRICK_ROWS, top=BRICK_TOP):
     inner_w = FIELD.width - (BRICK_COLS + 1) * BRICK_GAP
     bw = inner_w // BRICK_COLS
     bricks = []
-    for row in range(BRICK_ROWS):
+    for row in range(rows):
         for col in range(BRICK_COLS):
             x = FIELD.left + BRICK_GAP + col * (bw + BRICK_GAP)
-            y = BRICK_TOP + row * (BRICK_H + BRICK_GAP)
+            y = top + row * (BRICK_H + BRICK_GAP)
             color = BRICK_PALETTE[row % len(BRICK_PALETTE)]
-            # Higher rows are worth more.
-            points = (BRICK_ROWS - row) * 10
+            points = (rows - row) * 10
             bricks.append(Brick(pygame.Rect(x, y, bw, BRICK_H), color, points))
     return bricks
 
 
-def reflect_off_paddle(ball, paddle):
-    """Atari-style 5-zone paddle bounce. The closer to a paddle edge the
-    ball lands, the steeper the new vertical angle. Always reflects
-    upward."""
-    rel = (ball.x - paddle.x) / PADDLE_W      # 0..1 across the paddle
+def reflect_off_paddle(ball, paddle, downward=False):
+    """Atari 5-zone reflection. downward=True flips the bounce direction
+    (used for the AI paddle which reflects the ball back toward the
+    player)."""
+    rel = (ball.x - paddle.x) / PADDLE_W
     rel = max(0.0, min(1.0, rel))
-    # Bucket into zones: leftmost = -2, ..., rightmost = +2.
     zone = int(rel * PADDLE_ZONES)
     if zone >= PADDLE_ZONES:
         zone = PADDLE_ZONES - 1
-    # Map zone to an angle from straight-up (0) toward the side. Edge
-    # zones get ~60deg, center zone ~10deg.
     half = (PADDLE_ZONES - 1) * 0.5
-    t = (zone - half) / half       # -1..+1
+    t = (zone - half) / half
     angle = math.radians(60.0) * t
     speed = min(BALL_SPEED_MAX, ball.speed * BALL_SPEEDUP)
     ball.speed = speed
     ball.vx = math.sin(angle) * speed
-    ball.vy = -math.cos(angle) * speed
+    ball.vy = (math.cos(angle) if downward else -math.cos(angle)) * speed
 
 
 def aabb_circle_collision(rect, x, y, r):
-    """Return (hit, normal_x, normal_y, push_dx, push_dy). Standard
-    closest-point-on-rect test. Normal is the outward direction from the
-    rect to the ball; push_d* is how far we need to nudge the ball to
-    leave the rect again."""
     cx = max(rect.left, min(x, rect.right))
     cy = max(rect.top, min(y, rect.bottom))
     dx = x - cx
@@ -211,7 +275,6 @@ def aabb_circle_collision(rect, x, y, r):
     if d2 >= r * r:
         return False, 0, 0, 0, 0
     if d2 < 1e-9:
-        # Center inside the rect: pick the smallest-overlap side.
         left   = abs(x - rect.left)
         right  = abs(rect.right - x)
         top    = abs(y - rect.top)
@@ -234,37 +297,43 @@ def aabb_circle_collision(rect, x, y, r):
 
 
 class Game:
-    def __init__(self):
-        self.paddle = Paddle()
-        self.bricks = make_bricks()
+    """One Game instance can run either gameplay mode. mode is "solo"
+    or "ai"; we branch on it for layout, scoring, and update rules."""
+
+    def __init__(self, mode="solo"):
+        self.mode = mode
+        self.paddle = Paddle(PADDLE_Y)
+        self.ai = AIPaddle(AI_PADDLE_Y) if mode == "ai" else None
+        if mode == "ai":
+            self.bricks = make_bricks(rows=AI_BRICK_ROWS, top=AI_BRICK_TOP)
+        else:
+            self.bricks = make_bricks()
         self.balls = []
         self.score = 0
         self.next_extra_at = EXTRA_BALL_EVERY
-        self.lives = 3
-        self.state = "ready"      # ready | playing | gameover | paused
-        self.flash_timer = 0.0    # brief paddle flash on hit
-        self.shake = 0.0          # screen shake on brick destruction
+        self.lives = 3 if mode == "solo" else 1
+        self.state = "ready"
+        self.flash_timer = 0.0       # player paddle flash
+        self.ai_flash_timer = 0.0
+        self.shake = 0.0
+        self.elapsed = 0.0           # seconds survived (vs-AI mode)
+        self.score_accum = 0.0       # fractional survival score carry
 
     # ----- Ball spawning -----------------------------------------------
 
     def attach_ball_to_paddle(self):
-        """Spawn a single ball stuck to the top of the paddle, ready to
-        be launched with Space."""
         cx = self.paddle.x + PADDLE_W * 0.5
-        cy = PADDLE_Y - BALL_R - 1
+        cy = self.paddle.y - BALL_R - 1
         self.balls = [Ball(cx, cy, 0.0, 0.0, BALL_SPEED_START)]
 
     def launch_pinned_ball(self):
         for b in self.balls:
             if b.vx == 0 and b.vy == 0:
-                # Random small horizontal kick, always upward.
                 ang = math.radians(random.uniform(-30, 30))
                 b.vx =  math.sin(ang) * b.speed
                 b.vy = -math.cos(ang) * b.speed
 
     def spawn_extra_ball(self):
-        """Add a ball mid-flight from a random existing ball, kicked to
-        a slightly different angle. Caps at MAX_BALLS."""
         if len(self.balls) >= MAX_BALLS or not self.balls:
             return
         src = random.choice(self.balls)
@@ -277,12 +346,7 @@ class Game:
     # ----- Game flow ----------------------------------------------------
 
     def reset(self):
-        self.paddle = Paddle()
-        self.bricks = make_bricks()
-        self.score = 0
-        self.next_extra_at = EXTRA_BALL_EVERY
-        self.lives = 3
-        self.state = "ready"
+        self.__init__(mode=self.mode)
         self.attach_ball_to_paddle()
 
     def lose_ball(self, b):
@@ -296,8 +360,8 @@ class Game:
                 self.attach_ball_to_paddle()
 
     def add_score(self, points):
-        self.score += points
-        if self.score >= self.next_extra_at:
+        self.score += int(points)
+        if self.mode == "solo" and self.score >= self.next_extra_at:
             self.next_extra_at += EXTRA_BALL_EVERY
             self.spawn_extra_ball()
 
@@ -305,22 +369,31 @@ class Game:
 
     def update(self, dt, keys, mouse_pos):
         self.flash_timer = max(0.0, self.flash_timer - dt)
+        self.ai_flash_timer = max(0.0, self.ai_flash_timer - dt)
         self.shake = max(0.0, self.shake - dt * 8)
 
         self.paddle.update(dt, keys, mouse_pos)
+        if self.ai is not None:
+            self.ai.update(dt, self.balls)
 
         if self.state in ("ready", "gameover", "paused"):
-            # Even when paused, keep the pinned ball glued to the paddle
-            # so it doesn't drift.
             if self.state == "ready":
                 for b in self.balls:
                     if b.vx == 0 and b.vy == 0:
                         b.x = self.paddle.x + PADDLE_W * 0.5
-                        b.y = PADDLE_Y - BALL_R - 1
+                        b.y = self.paddle.y - BALL_R - 1
             return
 
-        # Step each ball with sub-stepping so a fast ball can't tunnel
-        # through a brick or the paddle. Up to 4 substeps per frame.
+        # Survival score in vs-AI mode.
+        if self.mode == "ai":
+            self.elapsed += dt
+            self.score_accum += AI_SURVIVAL_PER_SEC * dt
+            whole = int(self.score_accum)
+            if whole > 0:
+                self.score_accum -= whole
+                self.add_score(whole)
+
+        # Sub-stepped ball updates so fast balls don't tunnel.
         for b in self.balls:
             if not b.alive:
                 continue
@@ -331,41 +404,65 @@ class Game:
                 b.step(sdt)
                 self._handle_collisions(b)
 
-        # Drop dead balls.
         self.balls = [b for b in self.balls if b.alive]
 
-        # If we've cleared every brick, spawn a new layer (endless mode).
+        # Brick wall regenerates when cleared.
         if not any(br.alive for br in self.bricks):
-            self.bricks = make_bricks()
+            if self.mode == "ai":
+                self.bricks = make_bricks(rows=AI_BRICK_ROWS, top=AI_BRICK_TOP)
+            else:
+                self.bricks = make_bricks()
 
     def _handle_collisions(self, b):
-        # Walls: left, right, top.
+        # Side walls always reflect.
         if b.x - BALL_R < FIELD.left:
             b.x = FIELD.left + BALL_R
             b.vx = abs(b.vx)
         if b.x + BALL_R > FIELD.right:
             b.x = FIELD.right - BALL_R
             b.vx = -abs(b.vx)
-        if b.y - BALL_R < FIELD.top:
-            b.y = FIELD.top + BALL_R
-            b.vy = abs(b.vy)
 
-        # Bottom: lose this ball.
-        if b.y - BALL_R > FIELD.bottom:
-            self.lose_ball(b)
-            return
+        if self.mode == "solo":
+            # Top wall reflects; bottom is lethal.
+            if b.y - BALL_R < FIELD.top:
+                b.y = FIELD.top + BALL_R
+                b.vy = abs(b.vy)
+            if b.y - BALL_R > FIELD.bottom:
+                self.lose_ball(b)
+                return
+        else:
+            # vs AI: top is lethal for AI (but AI never misses, so this
+            # is mostly cosmetic - we still bounce off the top wall as a
+            # safety net in case prediction fails). Bottom is lethal for
+            # the player.
+            if b.y - BALL_R < FIELD.top:
+                b.y = FIELD.top + BALL_R
+                b.vy = abs(b.vy)
+            if b.y - BALL_R > FIELD.bottom:
+                self.lose_ball(b)
+                return
 
-        # Paddle.
+        # Player paddle.
         prect = self.paddle.rect
         hit, nx, ny, pdx, pdy = aabb_circle_collision(prect, b.x, b.y, BALL_R)
         if hit and b.vy > 0:
-            # Push ball back out, then use the Atari-style angle table.
             b.x += pdx; b.y += pdy
-            reflect_off_paddle(b, self.paddle)
+            reflect_off_paddle(b, self.paddle, downward=False)
             self.flash_timer = 0.12
+            if self.mode == "ai":
+                self.add_score(AI_PLAYER_HIT_BONUS)
 
-        # Bricks. We break the first brick we hit per substep, which is
-        # plenty for the speeds involved.
+        # AI paddle (vs-AI only).
+        if self.ai is not None:
+            arect = self.ai.rect
+            hit, nx, ny, pdx, pdy = aabb_circle_collision(arect, b.x, b.y, BALL_R)
+            if hit and b.vy < 0:
+                b.x += pdx; b.y += pdy
+                reflect_off_paddle(b, self.ai, downward=True)
+                self.ai_flash_timer = 0.12
+                self.add_score(AI_RETURN_BONUS)
+
+        # Bricks. First brick hit per substep wins.
         for br in self.bricks:
             if not br.alive:
                 continue
@@ -375,13 +472,10 @@ class Game:
             br.alive = False
             self.add_score(br.points)
             self.shake = 0.20
-            # Push out and reflect along the collision normal.
             b.x += pdx; b.y += pdy
-            # Reflect velocity along the normal vector.
             vdotn = b.vx * nx + b.vy * ny
             b.vx -= 2 * vdotn * nx
             b.vy -= 2 * vdotn * ny
-            # Slight speed up so the field doesn't get boring.
             new_speed = min(BALL_SPEED_MAX, b.speed * 1.01)
             scale = new_speed / max(1e-6, math.hypot(b.vx, b.vy))
             b.vx *= scale; b.vy *= scale
@@ -396,9 +490,6 @@ class Game:
 
 def draw_field(screen):
     pygame.draw.rect(screen, FIELD_BG, FIELD)
-    # Center dashed line — Pong's signature midline. Vertical here since
-    # there's no opponent above; we draw a thin horizontal band for
-    # decoration instead.
     dash_h = 14
     dash_gap = 10
     cx = FIELD.centerx
@@ -410,20 +501,19 @@ def draw_field(screen):
     pygame.draw.rect(screen, FIELD_LINE, FIELD, 2)
 
 
-def draw_paddle(screen, paddle, flash):
+def draw_paddle(screen, paddle, flash, color=PADDLE_COL, glow_color=PADDLE_GLOW):
     rect = paddle.rect
-    glow = PADDLE_GLOW if flash <= 0 else (240, 250, 255)
+    glow = glow_color if flash <= 0 else (240, 250, 255)
     inflate = 8
     glow_rect = rect.inflate(inflate, inflate)
     glow_surf = pygame.Surface(glow_rect.size, pygame.SRCALPHA)
     pygame.draw.rect(glow_surf, (*glow, 80),
                      glow_surf.get_rect(), border_radius=6)
     screen.blit(glow_surf, glow_rect.topleft, special_flags=pygame.BLEND_ADD)
-    pygame.draw.rect(screen, PADDLE_COL, rect, border_radius=4)
+    pygame.draw.rect(screen, color, rect, border_radius=4)
 
 
 def draw_ball(screen, b):
-    # Trail.
     for i, (tx, ty) in enumerate(b.trail):
         a = int(60 * (i + 1) / len(b.trail))
         s = pygame.Surface((BALL_R * 4, BALL_R * 4), pygame.SRCALPHA)
@@ -432,7 +522,6 @@ def draw_ball(screen, b):
         screen.blit(s, (tx - BALL_R * 2, ty - BALL_R * 2),
                     special_flags=pygame.BLEND_ADD)
     pygame.draw.circle(screen, BALL_COL, (int(b.x), int(b.y)), BALL_R)
-    # Tiny inner highlight.
     pygame.draw.circle(screen, (255, 255, 240),
                        (int(b.x - 2), int(b.y - 2)), max(1, BALL_R - 4))
 
@@ -442,52 +531,78 @@ def draw_bricks(screen, bricks):
         if not br.alive:
             continue
         pygame.draw.rect(screen, br.color, br.rect, border_radius=3)
-        # Top highlight stripe for that classic Breakout shading.
         hl = pygame.Rect(br.rect.x + 2, br.rect.y + 2,
                          br.rect.width - 4, 3)
         pygame.draw.rect(screen, (255, 255, 255, 60), hl, border_radius=2)
 
 
-def draw_hud(screen, font_big, font_small, game):
-    # Score (top center).
-    txt = font_big.render(f"{game.score:>04d}", True, ACCENT)
+def draw_hud(screen, font_med, font_small, game):
+    txt = font_med.render(f"{game.score:>05d}", True, ACCENT)
     screen.blit(txt, txt.get_rect(midtop=(WIDTH // 2, 6)))
 
-    # Lives (left).
-    label = font_small.render("LIVES", True, TEXT_DIM)
-    screen.blit(label, (FIELD.left + 2, 8))
-    for i in range(game.lives):
-        pygame.draw.rect(screen, PADDLE_COL,
-                         (FIELD.left + 2 + i * 18, 26, 14, 4))
-
-    # Active balls (right).
-    label = font_small.render("BALLS", True, TEXT_DIM)
-    screen.blit(label, (FIELD.right - 60, 8))
-    for i, _ in enumerate(game.balls):
-        pygame.draw.circle(screen, BALL_COL,
-                           (FIELD.right - 6 - i * 14, 28), 4)
+    if game.mode == "solo":
+        label = font_small.render("LIVES", True, TEXT_DIM)
+        screen.blit(label, (FIELD.left + 2, 8))
+        for i in range(game.lives):
+            pygame.draw.rect(screen, PADDLE_COL,
+                             (FIELD.left + 2 + i * 18, 26, 14, 4))
+        label = font_small.render("BALLS", True, TEXT_DIM)
+        screen.blit(label, (FIELD.right - 60, 8))
+        for i, _ in enumerate(game.balls):
+            pygame.draw.circle(screen, BALL_COL,
+                               (FIELD.right - 6 - i * 14, 28), 4)
+    else:
+        label = font_small.render("TIME", True, TEXT_DIM)
+        screen.blit(label, (FIELD.left + 2, 8))
+        t = font_small.render(f"{game.elapsed:6.1f}s", True, TEXT)
+        screen.blit(t, (FIELD.left + 2, 22))
+        label = font_small.render("MODE", True, TEXT_DIM)
+        screen.blit(label, (FIELD.right - 60, 8))
+        m = font_small.render("vs AI", True, AI_PADDLE_COL)
+        screen.blit(m, (FIELD.right - 60, 22))
 
 
 def draw_overlay_text(screen, font_big, font_small, game):
     if game.state == "ready":
         big = font_big.render("PRESS  SPACE", True, TEXT)
         screen.blit(big, big.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 12)))
-        small = font_small.render("Move with mouse / arrows.  Esc to quit.",
-                                  True, TEXT_DIM)
+        hint = "Move with mouse / arrows.  M = menu, Esc = quit."
+        small = font_small.render(hint, True, TEXT_DIM)
         screen.blit(small, small.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 22)))
     elif game.state == "gameover":
         big = font_big.render("GAME  OVER", True, GAMEOVER)
         screen.blit(big, big.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 12)))
-        small = font_small.render(f"Final score {game.score}.  R to restart.",
-                                  True, TEXT_DIM)
+        if game.mode == "ai":
+            line = f"Survived {game.elapsed:.1f}s.  Score {game.score}.  R restart, M menu."
+        else:
+            line = f"Final score {game.score}.  R restart, M menu."
+        small = font_small.render(line, True, TEXT_DIM)
         screen.blit(small, small.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 22)))
     elif game.state == "paused":
         big = font_big.render("PAUSED", True, ACCENT)
         screen.blit(big, big.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 12)))
 
 
+def draw_menu(screen, font_big, font_med, font_small):
+    title = font_big.render("PONG", True, ACCENT)
+    screen.blit(title, title.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 120)))
+
+    sub = font_med.render("Choose a mode", True, TEXT_DIM)
+    screen.blit(sub, sub.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 60)))
+
+    opt1 = font_med.render("[1]  SOLO  -  bricks, multi-ball, 3 lives",
+                           True, TEXT)
+    screen.blit(opt1, opt1.get_rect(center=(WIDTH // 2, HEIGHT // 2)))
+
+    opt2 = font_med.render("[2]  vs AI  -  survive a perfect opponent",
+                           True, AI_PADDLE_COL)
+    screen.blit(opt2, opt2.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 36)))
+
+    foot = font_small.render("Esc to quit.", True, TEXT_DIM)
+    screen.blit(foot, foot.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 100)))
+
+
 def draw_scanlines(screen):
-    """Cheap CRT scanline overlay: every other pixel row at low alpha."""
     overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
     for y in range(0, HEIGHT, 2):
         pygame.draw.line(overlay, (0, 0, 0, 60), (0, y), (WIDTH, y))
@@ -495,7 +610,6 @@ def draw_scanlines(screen):
 
 
 def draw_glow(screen):
-    """Soft additive glow: scale screen down then up. Cheap bloom."""
     small = pygame.transform.smoothscale(screen, (WIDTH // 4, HEIGHT // 4))
     blurred = pygame.transform.smoothscale(small, (WIDTH, HEIGHT))
     blurred.set_alpha(70)
@@ -509,7 +623,7 @@ def draw_glow(screen):
 
 def main():
     pygame.init()
-    pygame.display.set_caption("Solo Pong")
+    pygame.display.set_caption("Pong")
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     clock = pygame.time.Clock()
     font_big = pygame.font.SysFont("Menlo,Consolas,monospace", 36, bold=True)
@@ -518,8 +632,9 @@ def main():
 
     pygame.mouse.set_visible(False)
 
-    game = Game()
-    game.attach_ball_to_paddle()
+    # Top-level scene: "menu" or "play".
+    scene = "menu"
+    game = None
 
     while True:
         dt_ms = clock.tick(FPS)
@@ -533,46 +648,67 @@ def main():
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     pygame.quit(); sys.exit(0)
-                elif event.key == pygame.K_SPACE:
-                    if game.state == "ready":
-                        game.state = "playing"
-                        game.launch_pinned_ball()
-                    elif game.state == "playing":
-                        game.state = "paused"
-                    elif game.state == "paused":
-                        game.state = "playing"
-                elif event.key == pygame.K_r:
-                    if game.state == "gameover":
-                        game.reset()
+                if scene == "menu":
+                    if event.key == pygame.K_1:
+                        game = Game(mode="solo")
+                        game.attach_ball_to_paddle()
+                        scene = "play"
+                    elif event.key == pygame.K_2:
+                        game = Game(mode="ai")
+                        game.attach_ball_to_paddle()
+                        scene = "play"
+                else:
+                    if event.key == pygame.K_SPACE:
+                        if game.state == "ready":
+                            game.state = "playing"
+                            game.launch_pinned_ball()
+                        elif game.state == "playing":
+                            game.state = "paused"
+                        elif game.state == "paused":
+                            game.state = "playing"
+                    elif event.key == pygame.K_r:
+                        if game.state == "gameover":
+                            game.reset()
+                    elif event.key == pygame.K_m:
+                        scene = "menu"
+                        game = None
             elif event.type == pygame.MOUSEMOTION:
-                game.paddle.notice_mouse_move(mouse_pos)
+                if scene == "play" and game is not None:
+                    game.paddle.notice_mouse_move(mouse_pos)
 
-        game.update(dt, keys, mouse_pos)
-
-        # ---- Render ------------------------------------------------
+        # ---- Render -----------------------------------------------------
         screen.fill(BEZEL)
-        # Bezel inner outline.
         pygame.draw.rect(screen, BEZEL_LINE,
                          FIELD.inflate(8, 8), 2, border_radius=4)
 
-        # Optional screen shake.
-        ox = oy = 0
-        if game.shake > 0:
-            ox = random.randint(-3, 3)
-            oy = random.randint(-3, 3)
+        if scene == "menu":
+            layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            draw_field(layer)
+            screen.blit(layer, (0, 0))
+            draw_menu(screen, font_big, font_med, font_small)
+        else:
+            game.update(dt, keys, mouse_pos)
 
-        # Draw the field & contents to a temp surface so we can offset it.
-        layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        draw_field(layer)
-        draw_bricks(layer, game.bricks)
-        draw_paddle(layer, game.paddle, game.flash_timer)
-        for b in game.balls:
-            if b.alive:
-                draw_ball(layer, b)
-        screen.blit(layer, (ox, oy))
+            ox = oy = 0
+            if game.shake > 0:
+                ox = random.randint(-3, 3)
+                oy = random.randint(-3, 3)
 
-        draw_hud(screen, font_med, font_small, game)
-        draw_overlay_text(screen, font_big, font_small, game)
+            layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            draw_field(layer)
+            draw_bricks(layer, game.bricks)
+            draw_paddle(layer, game.paddle, game.flash_timer,
+                        color=PADDLE_COL, glow_color=PADDLE_GLOW)
+            if game.ai is not None:
+                draw_paddle(layer, game.ai, game.ai_flash_timer,
+                            color=AI_PADDLE_COL, glow_color=AI_PADDLE_GLOW)
+            for b in game.balls:
+                if b.alive:
+                    draw_ball(layer, b)
+            screen.blit(layer, (ox, oy))
+
+            draw_hud(screen, font_med, font_small, game)
+            draw_overlay_text(screen, font_big, font_small, game)
 
         draw_glow(screen)
         draw_scanlines(screen)
