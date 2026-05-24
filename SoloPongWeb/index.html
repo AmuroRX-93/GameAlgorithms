@@ -1,0 +1,1085 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Solo Pong</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #08090f;
+    color: #d8dceb;
+    font: 14px/1.4 Menlo, Consolas, monospace;
+    overflow: hidden;
+  }
+  /* Letterbox the game canvas: keep the native 4:3 aspect, fit inside
+     whatever the browser window is, center it. The canvas itself is
+     drawn at 960x720 internally; CSS scales it. */
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #wrap {
+    position: relative;
+    width: 100vmin;
+    /* 4:3 aspect via padding-box trick */
+    aspect-ratio: 4 / 3;
+    max-width: 100vw;
+    max-height: 100vh;
+  }
+  canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    background: #08090f;
+    border-radius: 4px;
+    box-shadow: 0 0 0 1px #2a3148, 0 12px 40px rgba(0,0,0,0.6);
+  }
+  /* Hint shown until the user clicks once (some browsers gate audio /
+     pointer-lock that way). Doesn't actually block input. */
+  #hint {
+    position: absolute;
+    top: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 4px 10px;
+    color: #7d859f;
+    font-size: 11px;
+    pointer-events: none;
+    opacity: 0.6;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="960" height="720"></canvas>
+  <div id="hint">Click canvas to focus &mdash; 1 / 2 / 3 / 4 to start</div>
+</div>
+<script>
+"use strict";
+
+/* =====================================================================
+   Solo Pong (web port of pong.py).
+
+   Same gameplay & AI as the Python version:
+     - Solo, vs AI, AI vs AI demo, AI Solo demo.
+     - 5-zone Atari paddle reflection with anti-vertical guard.
+     - Perfect-prediction AI with mirror-fold for side walls.
+     - Pressure-targeting (aim away from opponent), brick raycast aim,
+       weighted random sampling to break dead loops, and AI angle jitter.
+   ================================================================== */
+
+// ---------- constants ------------------------------------------------
+const WIDTH = 960, HEIGHT = 720;
+const FIELD_PAD = 24;
+const FIELD = {
+  left: FIELD_PAD,
+  top: FIELD_PAD,
+  right: WIDTH - FIELD_PAD,
+  bottom: HEIGHT - FIELD_PAD,
+  get width()  { return this.right - this.left; },
+  get height() { return this.bottom - this.top; },
+  get cx()     { return (this.left + this.right) / 2; },
+  get cy()     { return (this.top + this.bottom) / 2; },
+};
+
+const PADDLE_W = 110, PADDLE_H = 14;
+const PADDLE_Y    = FIELD.bottom - 38;   // solo / player paddle
+const AI_PADDLE_Y = FIELD.top + 24;      // top AI in vs-AI
+const PADDLE_SPEED    = 720;
+const AI_PADDLE_SPEED = 1200;
+const PADDLE_ZONES    = 5;
+
+const AI_ANGLE_JITTER = 8 * Math.PI / 180;  // rad
+
+const BALL_R          = 7;
+const BALL_SPEED_START = 380;
+const BALL_SPEED_MAX   = 760;
+const BALL_SPEEDUP     = 1.04;
+
+const BRICK_ROWS = 5, BRICK_COLS = 12, BRICK_GAP = 4;
+const BRICK_TOP = FIELD.top + 80;
+const BRICK_H   = 22;
+
+const EXTRA_BALL_EVERY = 100;
+const MAX_BALLS = 5;
+
+const AI_SURVIVAL_PER_SEC = 5;
+const AI_RETURN_BONUS     = 10;
+const AI_PLAYER_HIT_BONUS = 5;
+
+const COL = {
+  bg:        "#08090f",
+  bezel:     "#1c2032",
+  bezelLine: "#3c465f",
+  fieldBg:   "#0a0e16",
+  fieldLine: "#28324b",
+  paddle:    "#b4e6ff",
+  paddleGlow:"#5aa0dc",
+  aiPaddle:  "#ffaaaa",
+  aiGlow:    "#dc5a5a",
+  ball:      "#fff0c8",
+  text:      "#dce2f0",
+  textDim:   "#8c96af",
+  accent:    "#f5d250",
+  gameOver:  "#ff6e6e",
+};
+const BRICK_PALETTE = [
+  "#eb5a5a","#f5aa50","#f5dc5a","#82dc82","#6eb4f0",
+];
+
+const FPS_DT_CAP = 1 / 30;
+
+// small helpers
+const clamp = (v, lo, hi) => v < lo ? lo : (v > hi ? hi : v);
+const rand  = () => Math.random();
+const randRange = (a, b) => a + (b - a) * Math.random();
+const randInt = (n) => Math.floor(Math.random() * n);
+const choice = (arr) => arr[randInt(arr.length)];
+
+// =====================================================================
+//  Geometry / physics helpers (mirror of pong.py helpers)
+// =====================================================================
+
+function foldIntoField(x) {
+  // Mirror-fold an arbitrary x into [FIELD.left, FIELD.right] so a
+  // straight line through the side walls maps to its reflected x.
+  const span = FIELD.width;
+  const period = 2 * span;
+  let rel = ((x - FIELD.left) % period + period) % period;
+  if (rel > span) rel = period - rel;
+  return FIELD.left + rel;
+}
+
+function aabbCircleCollision(rect, cx, cy, r) {
+  // rect = {x,y,w,h}. Returns null on miss, or
+  // { nx, ny, pdx, pdy } push-out vector on hit.
+  const right = rect.x + rect.w, bottom = rect.y + rect.h;
+  const px = clamp(cx, rect.x, right);
+  const py = clamp(cy, rect.y, bottom);
+  const dx = cx - px, dy = cy - py;
+  const d2 = dx*dx + dy*dy;
+  if (d2 >= r * r) return null;
+  if (d2 < 1e-9) {
+    const left = Math.abs(cx - rect.x);
+    const rg   = Math.abs(right - cx);
+    const tp   = Math.abs(cy - rect.y);
+    const bt   = Math.abs(bottom - cy);
+    const m = Math.min(left, rg, tp, bt);
+    if (m === left) return { nx:-1, ny: 0, pdx:-(left + r), pdy: 0 };
+    if (m === rg)   return { nx: 1, ny: 0, pdx: (rg   + r), pdy: 0 };
+    if (m === tp)   return { nx: 0, ny:-1, pdx: 0,          pdy:-(tp + r) };
+    return            { nx: 0, ny: 1, pdx: 0,          pdy: (bt + r) };
+  }
+  const d = Math.sqrt(d2);
+  const nx = dx / d, ny = dy / d;
+  const push = r - d;
+  return { nx, ny, pdx: nx * push, pdy: ny * push };
+}
+
+function raycastFirstBrickHit(x0, y0, vx, vy, aliveBricks, maxT = 2.5) {
+  // Same brick-aim trajectory simulator as pong._raycast_first_brick_hit.
+  if (vy === 0) return null;
+  let x = x0, y = y0, t = 0;
+  const dt = 1 / 120;
+  while (t < maxT) {
+    x += vx * dt;
+    y += vy * dt;
+    t += dt;
+    if (x < FIELD.left)  { x = 2*FIELD.left  - x; vx = -vx; }
+    if (x > FIELD.right) { x = 2*FIELD.right - x; vx = -vx; }
+    if (y < FIELD.top || y > FIELD.bottom) return null;
+    for (const br of aliveBricks) {
+      const r = br.rect;
+      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+        return t;
+      }
+    }
+  }
+  return null;
+}
+
+function reflectOffPaddle(ball, paddle, downward, angleJitter) {
+  // Atari 5-zone reflection. downward=true makes the ball go +y after
+  // contact (used for the top AI). angleJitter (rad) adds AI noise.
+  // Anti-vertical guard nudges near-zero angles 4-10deg off so the
+  // ball can't get trapped in a vertical column.
+  let rel = (ball.x - paddle.x) / PADDLE_W;
+  rel = clamp(rel, 0, 1);
+  let zone = Math.floor(rel * PADDLE_ZONES);
+  if (zone >= PADDLE_ZONES) zone = PADDLE_ZONES - 1;
+  const half = (PADDLE_ZONES - 1) * 0.5;
+  const t = (zone - half) / half;
+  let angle = (60 * Math.PI / 180) * t;
+  if (angleJitter) angle += randRange(-angleJitter, angleJitter);
+  if (Math.abs(angle) < (3 * Math.PI / 180)) {
+    const sign = Math.random() < 0.5 ? -1 : 1;
+    angle = sign * randRange(4, 10) * Math.PI / 180;
+  }
+  const cap = 75 * Math.PI / 180;
+  angle = clamp(angle, -cap, cap);
+  const speed = Math.min(BALL_SPEED_MAX, ball.speed * BALL_SPEEDUP);
+  ball.speed = speed;
+  ball.vx = Math.sin(angle) * speed;
+  ball.vy = (downward ? Math.cos(angle) : -Math.cos(angle)) * speed;
+}
+
+// =====================================================================
+//  Entities
+// =====================================================================
+
+class Paddle {
+  // Horizontal paddle at fixed y. x clamps to the field. Mouse takeover
+  // is sticky -- once the user moves the mouse, the paddle follows it,
+  // until they press a key.
+  constructor(y) {
+    this.x = FIELD.cx - PADDLE_W * 0.5;
+    this.y = y;
+    this.useMouse = false;
+  }
+  get rect() { return { x: this.x, y: this.y, w: PADDLE_W, h: PADDLE_H }; }
+
+  update(dt, keys, mouseX, mouseInside) {
+    let kbDir = 0;
+    if (keys.has("ArrowLeft")  || keys.has("KeyA")) kbDir -= 1;
+    if (keys.has("ArrowRight") || keys.has("KeyD")) kbDir += 1;
+    if (kbDir !== 0) {
+      this.useMouse = false;
+      this.x += kbDir * PADDLE_SPEED * dt;
+    } else if (this.useMouse && mouseInside) {
+      const target = mouseX - PADDLE_W * 0.5;
+      this.x += (target - this.x) * Math.min(1, dt * 18);
+    }
+    this.x = clamp(this.x, FIELD.left, FIELD.right - PADDLE_W);
+  }
+
+  autoUpdate(dt, targetCenterX, maxSpeed) {
+    // AI-driven move: glide toward targetCenterX at the given speed cap.
+    const target = targetCenterX - PADDLE_W * 0.5;
+    let diff = target - this.x;
+    const step = (maxSpeed ?? PADDLE_SPEED) * dt;
+    if (diff >  step) diff =  step;
+    if (diff < -step) diff = -step;
+    this.x += diff;
+    this.x = clamp(this.x, FIELD.left, FIELD.right - PADDLE_W);
+  }
+
+  noticeMouseMove() { this.useMouse = true; }
+}
+
+class AIPaddle {
+  // Perfect-prediction paddle.
+  // bottom=true: lives at the bottom of the field (used in demo modes
+  // where both paddles are AI-driven).
+  constructor(y, player = null, bottom = false) {
+    this.x = FIELD.cx - PADDLE_W * 0.5;
+    this.y = y;
+    this.targetX = this.x;
+    this.player = player;
+    this.bottom = bottom;
+    // Cached aim decision per rally; only resampled when a fresh
+    // rally starts. Without this, the paddle either twitches every
+    // frame (if we resample always) or locks into one direction
+    // forever (if we keyed only on ball identity).
+    this._aimKey = null;
+    this._aimZone = null;
+    this._betweenRallies = true;
+  }
+  get rect() { return { x: this.x, y: this.y, w: PADDLE_W, h: PADDLE_H }; }
+
+  think(balls, opponentY, bricks) {
+    const contactY = this.bottom ? this.y : (this.y + PADDLE_H);
+    const incomingSign = this.bottom ? +1 : -1;
+
+    // Find nearest incoming ball.
+    let threat = null;
+    let bestT = Infinity;
+    for (const b of balls) {
+      if (!b.alive) continue;
+      if (incomingSign * b.vy <= 0) continue;
+      const t = (contactY - b.y) / b.vy;
+      if (t < 0) continue;
+      if (t < bestT) { bestT = t; threat = b; }
+    }
+    if (!threat) {
+      this.targetX = FIELD.cx - PADDLE_W * 0.5;
+      this._betweenRallies = true;
+      return;
+    }
+
+    const xContact = foldIntoField(threat.x + threat.vx * bestT);
+    const playerCx = this.player
+      ? this.player.x + PADDLE_W * 0.5
+      : FIELD.cx;
+    const outSpeed = Math.min(BALL_SPEED_MAX, threat.speed * BALL_SPEEDUP);
+
+    let targetY;
+    if (opponentY != null)        targetY = opponentY;
+    else if (this.player)         targetY = this.player.y;
+    else                          targetY = FIELD.top;
+    const dy = Math.abs(targetY - contactY);
+    const half = (PADDLE_ZONES - 1) * 0.5;
+
+    // Score every zone by how far it puts the ball from the opponent's
+    // current x. Then weighted-sample one (or pick by brick raycast).
+    const dists = [];
+    const zoneVels = [];
+    for (let zone = 0; zone < PADDLE_ZONES; zone++) {
+      const tZone = (zone - half) / half;
+      const angle = (60 * Math.PI / 180) * tZone;
+      const vxOut = Math.sin(angle) * outSpeed;
+      const vyMag = Math.cos(angle) * outSpeed;
+      const travelT = dy / Math.max(vyMag, 1e-3);
+      const xArrive = foldIntoField(xContact + vxOut * travelT);
+      dists.push(Math.abs(xArrive - playerCx));
+      const vyOut = this.bottom ? vyMag : -vyMag;
+      zoneVels.push([vxOut, vyOut]);
+    }
+
+    // Solo-demo brick aim: only when there's no opposing paddle and
+    // we're the bottom paddle (the demo's "player") and bricks remain.
+    const useBrickAim = (
+      this.player == null && bricks && bricks.length && this.bottom
+    );
+
+    const key = threat;  // identity; resample when ball reference changes
+    if (key !== this._aimKey || this._betweenRallies) {
+      const brickBonus = new Array(PADDLE_ZONES).fill(0);
+      const zoneHitT   = new Array(PADDLE_ZONES).fill(null);
+      let aliveBricks = null;
+      if (useBrickAim) {
+        aliveBricks = bricks.filter(br => br.alive);
+        if (aliveBricks.length) {
+          // Sparsity factor: 0.3 when full layout, 1.0 when nearly empty.
+          const n = aliveBricks.length;
+          const sparsity = 0.3 + 0.7 * clamp((50 - n) / 46, 0, 1);
+          for (let zi = 0; zi < PADDLE_ZONES; zi++) {
+            const [vxOut, vyOut] = zoneVels[zi];
+            const hitT = raycastFirstBrickHit(
+              xContact, contactY, vxOut, vyOut, aliveBricks);
+            zoneHitT[zi] = hitT;
+            if (hitT != null) {
+              brickBonus[zi] = sparsity * (1.5 + 1 / Math.max(hitT, 0.05));
+            }
+          }
+        }
+      }
+
+      const maxD = Math.max(...dists) || 1;
+      let chosen;
+
+      // AI Solo demo: if any zone hits a brick, deterministically pick
+      // the earliest hitter (100% accuracy is the point of the demo).
+      if (useBrickAim && zoneHitT.some(t => t != null)) {
+        let best = 0, bt = Infinity;
+        for (let zi = 0; zi < PADDLE_ZONES; zi++) {
+          const t = zoneHitT[zi];
+          if (t != null && t < bt) { bt = t; best = zi; }
+        }
+        chosen = best;
+      } else if (Math.random() < 0.30) {
+        // 30% pure random zone (breaks dead loops in AI vs AI).
+        chosen = randInt(PADDLE_ZONES);
+      } else {
+        // 70% weighted sample over farthest-from-opponent zones.
+        const weights = dists.map((d, i) =>
+          (d / maxD) ** 2 + 0.18 + brickBonus[i]);
+        const total = weights.reduce((s, w) => s + w, 0);
+        const r = Math.random() * total;
+        let acc = 0; chosen = 0;
+        for (let i = 0; i < weights.length; i++) {
+          acc += weights[i];
+          if (r <= acc) { chosen = i; break; }
+        }
+      }
+      this._aimKey = key;
+      this._aimZone = chosen;
+    }
+    this._betweenRallies = false;
+
+    const zoneCenterRel = (this._aimZone + 0.5) / PADDLE_ZONES;
+    this.targetX = xContact - zoneCenterRel * PADDLE_W;
+  }
+
+  update(dt, balls) {
+    this.think(balls, null, null);
+    let dx = this.targetX - this.x;
+    const step = AI_PADDLE_SPEED * dt;
+    if (dx >  step) dx =  step;
+    if (dx < -step) dx = -step;
+    this.x += dx;
+    this.x = clamp(this.x, FIELD.left, FIELD.right - PADDLE_W);
+  }
+}
+
+class Ball {
+  constructor(x, y, vx, vy, speed) {
+    this.x = x; this.y = y;
+    this.vx = vx; this.vy = vy;
+    this.speed = speed;
+    this.alive = true;
+    this.trail = [];
+  }
+  step(dt) {
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+    this.trail.push([this.x, this.y]);
+    if (this.trail.length > 8) this.trail.shift();
+  }
+}
+
+function makeBricks(rows = BRICK_ROWS, top = BRICK_TOP) {
+  const innerW = FIELD.width - (BRICK_COLS + 1) * BRICK_GAP;
+  const bw = Math.floor(innerW / BRICK_COLS);
+  const bricks = [];
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < BRICK_COLS; col++) {
+      const x = FIELD.left + BRICK_GAP + col * (bw + BRICK_GAP);
+      const y = top + row * (BRICK_H + BRICK_GAP);
+      const color = BRICK_PALETTE[row % BRICK_PALETTE.length];
+      const points = (rows - row) * 10;
+      bricks.push({
+        rect: { x, y, w: bw, h: BRICK_H },
+        color, alive: true, points,
+      });
+    }
+  }
+  return bricks;
+}
+
+// =====================================================================
+//  Game state
+// =====================================================================
+
+class Game {
+  // mode: "solo" | "ai".  demo: bottom paddle is also AI-driven.
+  constructor(mode = "solo", demo = false) {
+    this.mode = mode;
+    this.demo = demo;
+    this.paddle = new Paddle(PADDLE_Y);
+    this.ai = (mode === "ai")
+      ? new AIPaddle(AI_PADDLE_Y, this.paddle, false)
+      : null;
+    this.playerAi = null;
+    if (demo) {
+      const opponent = this.ai;  // null in solo demo
+      this.playerAi = new AIPaddle(PADDLE_Y, opponent, true);
+    }
+    this.bricks = (mode === "ai") ? [] : makeBricks();
+    this.balls = [];
+    this.score = 0;
+    this.nextExtraAt = EXTRA_BALL_EVERY;
+    this.lives = (mode === "solo") ? 3 : 1;
+    this.state = "ready";  // "ready" | "playing" | "paused" | "gameover"
+    this.flashTimer = 0;
+    this.aiFlashTimer = 0;
+    this.shake = 0;
+    this.elapsed = 0;
+    this.scoreAccum = 0;
+  }
+
+  attachBallToPaddle() {
+    const cx = this.paddle.x + PADDLE_W * 0.5;
+    const cy = this.paddle.y - BALL_R - 1;
+    this.balls = [new Ball(cx, cy, 0, 0, BALL_SPEED_START)];
+  }
+
+  launchPinnedBall() {
+    for (const b of this.balls) {
+      if (b.vx === 0 && b.vy === 0) {
+        const ang = randRange(-30, 30) * Math.PI / 180;
+        b.vx =  Math.sin(ang) * b.speed;
+        b.vy = -Math.cos(ang) * b.speed;
+      }
+    }
+  }
+
+  spawnExtraBall() {
+    if (this.balls.length >= MAX_BALLS || !this.balls.length) return;
+    const src = choice(this.balls);
+    const ang = Math.atan2(src.vy, src.vx) + (Math.random() < 0.5 ? -0.6 : 0.6);
+    const speed = src.speed;
+    this.balls.push(new Ball(
+      src.x, src.y,
+      Math.cos(ang) * speed, Math.sin(ang) * speed,
+      speed));
+  }
+
+  reset() {
+    const newGame = new Game(this.mode, this.demo);
+    Object.assign(this, newGame);
+    this.attachBallToPaddle();
+  }
+
+  loseBall(b) {
+    b.alive = false;
+    if (this.balls.every(bb => !bb.alive)) {
+      this.lives -= 1;
+      if (this.lives <= 0) {
+        if (this.demo) {
+          // Demo never ends.
+          this.lives = (this.mode === "solo") ? 3 : 1;
+          this.score = 0;
+          this.elapsed = 0;
+          this.scoreAccum = 0;
+          this.state = "ready";
+          if (this.mode === "solo") this.bricks = makeBricks();
+          this.attachBallToPaddle();
+        } else {
+          this.state = "gameover";
+        }
+      } else {
+        this.state = "ready";
+        this.attachBallToPaddle();
+      }
+    }
+  }
+
+  addScore(points) {
+    this.score += points | 0;
+    if (this.mode === "solo" && this.score >= this.nextExtraAt) {
+      this.nextExtraAt += EXTRA_BALL_EVERY;
+      this.spawnExtraBall();
+    }
+  }
+
+  update(dt, keys, mouseX, mouseInside) {
+    this.flashTimer = Math.max(0, this.flashTimer - dt);
+    this.aiFlashTimer = Math.max(0, this.aiFlashTimer - dt);
+    this.shake = Math.max(0, this.shake - dt * 8);
+
+    if (this.demo && this.playerAi) {
+      this.playerAi.think(this.balls, null, this.bricks);
+      this.paddle.autoUpdate(
+        dt, this.playerAi.targetX + PADDLE_W * 0.5, AI_PADDLE_SPEED);
+    } else {
+      this.paddle.update(dt, keys, mouseX, mouseInside);
+    }
+    if (this.ai) this.ai.update(dt, this.balls);
+
+    if (this.state === "ready" || this.state === "gameover" || this.state === "paused") {
+      if (this.state === "ready") {
+        for (const b of this.balls) {
+          if (b.vx === 0 && b.vy === 0) {
+            b.x = this.paddle.x + PADDLE_W * 0.5;
+            b.y = this.paddle.y - BALL_R - 1;
+          }
+        }
+        if (this.demo) {
+          this.state = "playing";
+          this.launchPinnedBall();
+        }
+      }
+      return;
+    }
+
+    // Survival score in vs-AI mode.
+    if (this.mode === "ai") {
+      this.elapsed += dt;
+      this.scoreAccum += AI_SURVIVAL_PER_SEC * dt;
+      const whole = Math.floor(this.scoreAccum);
+      if (whole > 0) {
+        this.scoreAccum -= whole;
+        this.addScore(whole);
+      }
+    }
+
+    // Sub-stepped ball updates so fast balls don't tunnel.
+    for (const b of this.balls) {
+      if (!b.alive) continue;
+      let steps = Math.max(1, Math.ceil(b.speed * dt / (BALL_R * 1.4)));
+      steps = Math.min(steps, 4);
+      const sdt = dt / steps;
+      for (let s = 0; s < steps; s++) {
+        b.step(sdt);
+        this._handleCollisions(b);
+      }
+    }
+    this.balls = this.balls.filter(b => b.alive);
+
+    // Brick wall regen (solo only).
+    if (this.mode === "solo" && !this.bricks.some(br => br.alive)) {
+      this.bricks = makeBricks();
+    }
+  }
+
+  _handleCollisions(b) {
+    // Side walls always reflect.
+    if (b.x - BALL_R < FIELD.left) {
+      b.x = FIELD.left + BALL_R;
+      b.vx = Math.abs(b.vx);
+    }
+    if (b.x + BALL_R > FIELD.right) {
+      b.x = FIELD.right - BALL_R;
+      b.vx = -Math.abs(b.vx);
+    }
+
+    if (this.mode === "solo") {
+      if (b.y - BALL_R < FIELD.top) {
+        b.y = FIELD.top + BALL_R;
+        b.vy = Math.abs(b.vy);
+      }
+      if (b.y - BALL_R > FIELD.bottom) { this.loseBall(b); return; }
+    } else {
+      // vs AI: top is "AI's" plane; we still bounce there as safety.
+      if (b.y - BALL_R < FIELD.top) {
+        b.y = FIELD.top + BALL_R;
+        b.vy = Math.abs(b.vy);
+      }
+      if (b.y - BALL_R > FIELD.bottom) { this.loseBall(b); return; }
+    }
+
+    // Bottom paddle.
+    {
+      const pr = this.paddle.rect;
+      const c = aabbCircleCollision(pr, b.x, b.y, BALL_R);
+      if (c && b.vy > 0) {
+        b.x += c.pdx; b.y += c.pdy;
+        // AI vs AI demo: jitter for ai mode demo only. AI Solo demo
+        // wants exact reflection (the brick raycast assumes exact).
+        const jitter = (this.demo && this.mode === "ai")
+          ? AI_ANGLE_JITTER : 0;
+        reflectOffPaddle(b, this.paddle, false, jitter);
+        this.flashTimer = 0.12;
+        if (this.mode === "ai") this.addScore(AI_PLAYER_HIT_BONUS);
+      }
+    }
+
+    // Top AI paddle (vs-AI only).
+    if (this.ai) {
+      const ar = this.ai.rect;
+      const c = aabbCircleCollision(ar, b.x, b.y, BALL_R);
+      if (c && b.vy < 0) {
+        b.x += c.pdx; b.y += c.pdy;
+        reflectOffPaddle(b, this.ai, true, AI_ANGLE_JITTER);
+        this.aiFlashTimer = 0.12;
+        this.addScore(AI_RETURN_BONUS);
+      }
+    }
+
+    // Bricks. First hit per substep wins.
+    for (const br of this.bricks) {
+      if (!br.alive) continue;
+      const c = aabbCircleCollision(br.rect, b.x, b.y, BALL_R);
+      if (!c) continue;
+      br.alive = false;
+      this.addScore(br.points);
+      this.shake = 0.20;
+      b.x += c.pdx; b.y += c.pdy;
+      const vdotn = b.vx * c.nx + b.vy * c.ny;
+      b.vx -= 2 * vdotn * c.nx;
+      b.vy -= 2 * vdotn * c.ny;
+      const newSpeed = Math.min(BALL_SPEED_MAX, b.speed * 1.01);
+      const scale = newSpeed / Math.max(1e-6, Math.hypot(b.vx, b.vy));
+      b.vx *= scale; b.vy *= scale;
+      b.speed = newSpeed;
+      break;
+    }
+  }
+}
+
+// =====================================================================
+//  Rendering
+// =====================================================================
+
+function drawField(ctx) {
+  ctx.fillStyle = COL.fieldBg;
+  ctx.fillRect(FIELD.left, FIELD.top, FIELD.width, FIELD.height);
+
+  // Dashed center line.
+  ctx.strokeStyle = COL.fieldLine;
+  ctx.lineWidth = 3;
+  const dashH = 14, dashGap = 10;
+  let y = FIELD.top + 8;
+  ctx.beginPath();
+  while (y < FIELD.bottom - 8) {
+    ctx.moveTo(FIELD.cx, y);
+    ctx.lineTo(FIELD.cx, Math.min(FIELD.bottom - 8, y + dashH));
+    y += dashH + dashGap;
+  }
+  ctx.stroke();
+
+  // Field border.
+  ctx.lineWidth = 2;
+  ctx.strokeRect(FIELD.left, FIELD.top, FIELD.width, FIELD.height);
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  if (r > Math.min(w, h) * 0.5) r = Math.min(w, h) * 0.5;
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function drawPaddle(ctx, paddle, flash, color, glowColor) {
+  const r = paddle.rect;
+  // Glow halo (additive-ish via low-alpha rect underneath).
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  ctx.fillStyle = (flash > 0) ? "rgba(240,250,255,0.6)" : glowColor + "60";
+  // hex+alpha (#rrggbbaa) is fine in modern browsers; fall back below.
+  roundRect(ctx, r.x - 4, r.y - 4, r.w + 8, r.h + 8, 6);
+  ctx.fill();
+  ctx.restore();
+
+  ctx.fillStyle = color;
+  roundRect(ctx, r.x, r.y, r.w, r.h, 4);
+  ctx.fill();
+}
+
+function drawBall(ctx, b) {
+  // Trail.
+  if (b.trail.length) {
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (let i = 0; i < b.trail.length; i++) {
+      const [tx, ty] = b.trail[i];
+      const a = Math.floor(60 * (i + 1) / b.trail.length);
+      ctx.fillStyle = `rgba(255,240,200,${a / 255})`;
+      ctx.beginPath();
+      ctx.arc(tx, ty, BALL_R * 0.9, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+  ctx.fillStyle = COL.ball;
+  ctx.beginPath();
+  ctx.arc(b.x, b.y, BALL_R, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#fffff0";
+  ctx.beginPath();
+  ctx.arc(b.x - 2, b.y - 2, Math.max(1, BALL_R - 4), 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawBricks(ctx, bricks) {
+  for (const br of bricks) {
+    if (!br.alive) continue;
+    ctx.fillStyle = br.color;
+    roundRect(ctx, br.rect.x, br.rect.y, br.rect.w, br.rect.h, 3);
+    ctx.fill();
+    // Highlight strip on top.
+    ctx.fillStyle = "rgba(255,255,255,0.20)";
+    roundRect(ctx, br.rect.x + 2, br.rect.y + 2, br.rect.w - 4, 3, 2);
+    ctx.fill();
+  }
+}
+
+function drawText(ctx, txt, x, y, opts = {}) {
+  const {
+    color = COL.text,
+    size = 18,
+    bold = false,
+    align = "left",
+    baseline = "alphabetic",
+  } = opts;
+  ctx.fillStyle = color;
+  ctx.font = `${bold ? "bold " : ""}${size}px Menlo, Consolas, monospace`;
+  ctx.textAlign = align;
+  ctx.textBaseline = baseline;
+  ctx.fillText(txt, x, y);
+}
+
+function drawHUD(ctx, game) {
+  drawText(ctx, String(game.score).padStart(5, "0"),
+    WIDTH / 2, 8,
+    { color: COL.accent, size: 30, bold: true,
+      align: "center", baseline: "top" });
+
+  if (game.mode === "solo") {
+    drawText(ctx, "LIVES", FIELD.left + 2, 8,
+      { color: COL.textDim, size: 11, baseline: "top" });
+    for (let i = 0; i < game.lives; i++) {
+      ctx.fillStyle = COL.paddle;
+      ctx.fillRect(FIELD.left + 2 + i * 18, 26, 14, 4);
+    }
+    drawText(ctx, "BALLS", FIELD.right - 60, 8,
+      { color: COL.textDim, size: 11, baseline: "top" });
+    for (let i = 0; i < game.balls.length; i++) {
+      ctx.fillStyle = COL.ball;
+      ctx.beginPath();
+      ctx.arc(FIELD.right - 6 - i * 14, 28, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  } else {
+    drawText(ctx, "TIME", FIELD.left + 2, 8,
+      { color: COL.textDim, size: 11, baseline: "top" });
+    drawText(ctx, `${game.elapsed.toFixed(1)}s`,
+      FIELD.left + 2, 22,
+      { color: COL.text, size: 11, baseline: "top" });
+    drawText(ctx, "MODE", FIELD.right - 60, 8,
+      { color: COL.textDim, size: 11, baseline: "top" });
+    drawText(ctx, game.demo ? "AI vs AI" : "vs AI",
+      FIELD.right - 60, 22,
+      { color: COL.aiPaddle, size: 11, baseline: "top" });
+  }
+}
+
+function drawOverlayText(ctx, game) {
+  if (game.state === "ready") {
+    drawText(ctx, "PRESS  SPACE", WIDTH/2, HEIGHT/2 - 12,
+      { color: COL.text, size: 36, bold: true, align: "center", baseline: "middle" });
+    drawText(ctx, "Move with mouse / arrows.  M = menu.",
+      WIDTH/2, HEIGHT/2 + 22,
+      { color: COL.textDim, size: 13, align: "center", baseline: "middle" });
+  } else if (game.state === "gameover") {
+    drawText(ctx, "GAME  OVER", WIDTH/2, HEIGHT/2 - 12,
+      { color: COL.gameOver, size: 36, bold: true, align: "center", baseline: "middle" });
+    const line = (game.mode === "ai")
+      ? `Survived ${game.elapsed.toFixed(1)}s.  Score ${game.score}.  R restart, M menu.`
+      : `Final score ${game.score}.  R restart, M menu.`;
+    drawText(ctx, line, WIDTH/2, HEIGHT/2 + 22,
+      { color: COL.textDim, size: 13, align: "center", baseline: "middle" });
+  } else if (game.state === "paused") {
+    drawText(ctx, "PAUSED", WIDTH/2, HEIGHT/2 - 12,
+      { color: COL.accent, size: 36, bold: true, align: "center", baseline: "middle" });
+  }
+}
+
+function drawMenu(ctx) {
+  drawText(ctx, "PONG", WIDTH/2, HEIGHT/2 - 160,
+    { color: COL.accent, size: 56, bold: true, align: "center", baseline: "middle" });
+  drawText(ctx, "Choose a mode", WIDTH/2, HEIGHT/2 - 100,
+    { color: COL.textDim, size: 18, align: "center", baseline: "middle" });
+
+  drawText(ctx, "[1]  SOLO  -  bricks, multi-ball, 3 lives",
+    WIDTH/2, HEIGHT/2 - 40,
+    { color: COL.text, size: 18, align: "center", baseline: "middle" });
+  drawText(ctx, "[2]  vs AI  -  survive a perfect opponent",
+    WIDTH/2, HEIGHT/2,
+    { color: COL.aiPaddle, size: 18, align: "center", baseline: "middle" });
+
+  drawText(ctx, "Demos", WIDTH/2, HEIGHT/2 + 50,
+    { color: COL.textDim, size: 18, align: "center", baseline: "middle" });
+  drawText(ctx, "[3]  AI  vs  AI  -  watch them rally forever",
+    WIDTH/2, HEIGHT/2 + 86,
+    { color: COL.accent, size: 18, align: "center", baseline: "middle" });
+  drawText(ctx, "[4]  AI  Solo  -  watch a perfect bricks run",
+    WIDTH/2, HEIGHT/2 + 118,
+    { color: COL.accent, size: 18, align: "center", baseline: "middle" });
+
+  drawText(ctx, "Click canvas to focus, then press a number.",
+    WIDTH/2, HEIGHT/2 + 180,
+    { color: COL.textDim, size: 12, align: "center", baseline: "middle" });
+}
+
+function drawScanlines(ctx) {
+  // Cheap CRT scanlines: a 2px-period horizontal stripe overlay.
+  ctx.save();
+  ctx.fillStyle = "rgba(0,0,0,0.24)";
+  for (let y = 0; y < HEIGHT; y += 2) {
+    ctx.fillRect(0, y, WIDTH, 1);
+  }
+  ctx.restore();
+}
+
+// In-game MENU button (top-right corner).
+function menuButtonRect() {
+  const w = 72, h = 24;
+  return { x: WIDTH - w - FIELD_PAD - 4, y: 4, w, h };
+}
+
+function drawMenuButton(ctx, hover) {
+  const r = menuButtonRect();
+  ctx.save();
+  ctx.fillStyle = hover ? "rgba(245,210,80,0.18)" : "rgba(40,50,75,0.55)";
+  ctx.strokeStyle = hover ? COL.accent : COL.bezelLine;
+  ctx.lineWidth = 1;
+  roundRect(ctx, r.x, r.y, r.w, r.h, 4);
+  ctx.fill();
+  ctx.stroke();
+  drawText(ctx, "MENU", r.x + r.w / 2, r.y + r.h / 2,
+    { color: hover ? COL.text : COL.textDim, size: 12, bold: true,
+      align: "center", baseline: "middle" });
+  ctx.restore();
+}
+
+// =====================================================================
+//  Main loop / input
+// =====================================================================
+
+(function main() {
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  // The CSS sizes the canvas; the backing buffer is fixed at WIDTH x HEIGHT.
+  // We render in canvas coordinates directly; the browser scales it.
+  ctx.imageSmoothingEnabled = false;
+
+  // ---- Input state -------------------------------------------------
+  const keys = new Set();
+  let mouseX = WIDTH / 2;
+  let mouseY = HEIGHT / 2;
+  let mouseInside = false;
+  let mouseDown = false;
+  let mouseClicked = false;  // edge-trigger for the MENU button
+
+  function canvasCoords(evt) {
+    const rect = canvas.getBoundingClientRect();
+    const sx = WIDTH / rect.width;
+    const sy = HEIGHT / rect.height;
+    return [
+      (evt.clientX - rect.left) * sx,
+      (evt.clientY - rect.top)  * sy,
+    ];
+  }
+
+  // Keep keyboard focus on the page (canvas does not need to be focused).
+  // We listen on window so arrow keys etc. always reach us, but make
+  // sure to preventDefault for the keys we use to avoid scrolling.
+  const SWALLOW = new Set([
+    "Space", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown",
+  ]);
+  window.addEventListener("keydown", (e) => {
+    keys.add(e.code);
+    if (SWALLOW.has(e.code)) e.preventDefault();
+  });
+  window.addEventListener("keyup", (e) => {
+    keys.delete(e.code);
+  });
+
+  canvas.addEventListener("mousemove", (e) => {
+    [mouseX, mouseY] = canvasCoords(e);
+    mouseInside = true;
+    if (game) game.paddle.noticeMouseMove();
+  });
+  canvas.addEventListener("mouseleave", () => { mouseInside = false; });
+  canvas.addEventListener("mouseenter", () => { mouseInside = true; });
+  canvas.addEventListener("mousedown", (e) => {
+    [mouseX, mouseY] = canvasCoords(e);
+    mouseDown = true;
+    mouseClicked = true;
+  });
+  window.addEventListener("mouseup", () => { mouseDown = false; });
+
+  // ---- Scene state -------------------------------------------------
+  let scene = "menu";  // "menu" | "play"
+  let game = null;
+
+  function start(mode, demo = false) {
+    game = new Game(mode, demo);
+    game.attachBallToPaddle();
+    scene = "play";
+  }
+
+  // ---- Per-frame loop ---------------------------------------------
+  let lastT = performance.now() / 1000;
+  function frame() {
+    const now = performance.now() / 1000;
+    let dt = now - lastT;
+    lastT = now;
+    if (dt > FPS_DT_CAP) dt = FPS_DT_CAP;
+
+    // ---- Handle keydown edges via "just-pressed" set --------------
+    // We snapshot keys per frame; for one-shot triggers (Space, R, M,
+    // 1..4, Esc) we use a separate "edge" mechanism: mark as consumed
+    // after first read.
+    handleEdgeKeys();
+    handleMouseClick();
+
+    // ---- Update / draw -------------------------------------------
+    ctx.fillStyle = COL.bg;
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+    if (scene === "menu") {
+      drawMenu(ctx);
+    } else {
+      game.update(dt, keys, mouseX, mouseInside);
+      drawField(ctx);
+      drawBricks(ctx, game.bricks);
+      drawPaddle(ctx, game.paddle, game.flashTimer,
+                 COL.paddle, COL.paddleGlow);
+      if (game.ai) {
+        drawPaddle(ctx, game.ai, game.aiFlashTimer,
+                   COL.aiPaddle, COL.aiGlow);
+      }
+      for (const b of game.balls) drawBall(ctx, b);
+      drawHUD(ctx, game);
+      drawOverlayText(ctx, game);
+
+      const mr = menuButtonRect();
+      const hover = (
+        mouseX >= mr.x && mouseX <= mr.x + mr.w &&
+        mouseY >= mr.y && mouseY <= mr.y + mr.h
+      );
+      drawMenuButton(ctx, hover);
+    }
+
+    drawScanlines(ctx);
+    requestAnimationFrame(frame);
+  }
+
+  // One-shot key handling. We watch keys we care about and clear them
+  // immediately so they don't fire on every frame.
+  function consume(code) {
+    if (keys.has(code)) { keys.delete(code); return true; }
+    return false;
+  }
+  function handleEdgeKeys() {
+    if (consume("Escape")) {
+      if (scene === "play") { scene = "menu"; game = null; }
+    }
+    if (consume("KeyM")) {
+      if (scene === "play") { scene = "menu"; game = null; }
+    }
+    if (scene === "menu") {
+      if (consume("Digit1")) start("solo");
+      else if (consume("Digit2")) start("ai");
+      else if (consume("Digit3")) start("ai", true);
+      else if (consume("Digit4")) start("solo", true);
+    } else {
+      // In-game one-shots.
+      if (consume("Space")) {
+        if (!game.demo) {
+          if (game.state === "ready") {
+            game.state = "playing";
+            game.launchPinnedBall();
+          } else if (game.state === "playing") {
+            game.state = "paused";
+          } else if (game.state === "paused") {
+            game.state = "playing";
+          }
+        }
+      }
+      if (consume("KeyR")) {
+        if (game.state === "gameover") game.reset();
+      }
+    }
+  }
+
+  function handleMouseClick() {
+    if (!mouseClicked) return;
+    mouseClicked = false;
+    if (scene === "play") {
+      const mr = menuButtonRect();
+      if (mouseX >= mr.x && mouseX <= mr.x + mr.w &&
+          mouseY >= mr.y && mouseY <= mr.y + mr.h) {
+        scene = "menu";
+        game = null;
+      }
+    }
+    // (Menu doesn't have clickable items; the on-screen text says to
+    //  press a number. Keeps things simple.)
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
+
+
+
+

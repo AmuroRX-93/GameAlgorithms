@@ -1,10 +1,10 @@
-name: Deploy SoloPong to GitHub Pages
+name: Deploy GameAlgorithms to GitHub Pages
 
 on:
   push:
     branches: [main]
     paths:
-      - 'SoloPong/**'
+      - 'SoloPongWeb/**'
       - 'site/**'
       - '.github/workflows/deploy-pages.yml'
   workflow_dispatch:
@@ -25,36 +25,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install pygbag
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install pygbag
-
-      - name: Build SoloPong with pygbag
-        # pygbag --build packages SoloPong/ into SoloPong/build/web/
-        # without starting its dev server. The runtime is fetched from
-        # the pygame-web archive and bundled into the output.
-        #
-        # --ume_block 0 disables the "Click to start" splash overlay,
-        # which otherwise leaves the canvas blank until the user
-        # interacts. The game has its own menu, so we don't need it.
-        run: |
-          python -m pygbag --build --ume_block 0 --can_close 0 \
-            --app_name SoloPong --title "Solo Pong" \
-            SoloPong
-
       - name: Stage site
         # Layout we deploy:
         #   /                -> landing page (links to each playable demo)
-        #   /SoloPong/       -> the pygbag bundle
+        #   /SoloPong/       -> the Solo Pong game (single static page)
+        #
+        # No build step: SoloPongWeb is plain HTML + JS, so we just copy.
         run: |
           mkdir -p _site/SoloPong
-          cp -R SoloPong/build/web/. _site/SoloPong/
+          cp -R SoloPongWeb/. _site/SoloPong/
           cp site/index.html _site/index.html
 
       - name: Upload Pages artifact
