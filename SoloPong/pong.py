@@ -52,6 +52,10 @@ PADDLE_ZONES = 5
 # the return that lands farthest from the player's current x. See
 # AIPaddle.think.
 AI_PADDLE_SPEED = 1200.0
+# Small reflection-angle jitter (radians) added on AI bounces. Continuous
+# noise here breaks the otherwise-finite state space of the rally and
+# stops AI vs AI demos from collapsing into a 2- or 4-cycle.
+AI_ANGLE_JITTER = math.radians(8.0)
 
 BALL_R = 7
 BALL_SPEED_START = 380.0
@@ -159,6 +163,11 @@ class AIPaddle:
         self.target_x = self.x
         self.player = player    # opposing paddle (for aim-away logic)
         self.bottom = bottom    # True for the bottom paddle in demo mode
+        # Cached aim decision per rally. We resample only when the ball
+        # we're tracking changes or its vy direction flips, so the
+        # paddle doesn't twitch every frame chasing fresh random choices.
+        self._aim_key = None
+        self._aim_zone = None
 
     @property
     def rect(self):
@@ -210,7 +219,6 @@ class AIPaddle:
             player_cx = FIELD.centerx
 
         out_speed = min(BALL_SPEED_MAX, threat.speed * BALL_SPEEDUP)
-        # Vertical distance to opponent's plane (positive number).
         if opponent_y is not None:
             target_y = opponent_y
         elif self.player is not None:
@@ -221,24 +229,52 @@ class AIPaddle:
         dy = abs(target_y - contact_y)
         half = (PADDLE_ZONES - 1) * 0.5
 
-        best_zone = 0
-        best_dist = -1.0
+        # Score every zone by how far it puts the ball from the
+        # opponent's current x. Then weighted-sample one. Using random
+        # sampling (instead of strict argmax) breaks the deterministic
+        # symmetry that produces dead-loop rallies in AI vs AI demos,
+        # and keeps the human-vs-AI mode from feeling robotic.
+        dists = []
         for zone in range(PADDLE_ZONES):
             t_zone = (zone - half) / half
             angle = math.radians(60.0) * t_zone
             vx_out = math.sin(angle) * out_speed
-            # Outgoing vy points away from us. For top AI that's down
-            # (positive); for bottom AI that's up (negative). Magnitude
-            # is the same.
             vy_mag = math.cos(angle) * out_speed
             travel_t = dy / max(vy_mag, 1e-3)
             x_arrive = _fold_into_field(x_contact + vx_out * travel_t)
-            dist = abs(x_arrive - player_cx)
-            if dist > best_dist:
-                best_dist = dist
-                best_zone = zone
+            dists.append(abs(x_arrive - player_cx))
 
-        zone_center_rel = (best_zone + 0.5) / PADDLE_ZONES
+        # Resample only when this is a new rally (different ball or
+        # the ball's vy flipped sign), so the paddle commits to one
+        # aim and doesn't twitch every frame.
+        key = (id(threat), threat.vy > 0)
+        if key != self._aim_key:
+            max_d = max(dists) or 1.0
+            # Two-tier randomness to defeat dead-loops:
+            #   30% of the time pick a fully random zone, ignoring
+            #   distance, so the trajectory takes a real detour.
+            #   The remaining 70% sample from a softmax-ish weighting
+            #   that prefers the farthest zones but keeps every zone
+            #   reachable. The combination guarantees the rally never
+            #   settles into a 2- or 4-cycle the way a strict argmax
+            #   does.
+            if random.random() < 0.30:
+                chosen = random.randrange(PADDLE_ZONES)
+            else:
+                weights = [(d / max_d) ** 2 + 0.18 for d in dists]
+                total = sum(weights)
+                r = random.random() * total
+                acc = 0.0
+                chosen = 0
+                for i, w in enumerate(weights):
+                    acc += w
+                    if r <= acc:
+                        chosen = i
+                        break
+            self._aim_key = key
+            self._aim_zone = chosen
+
+        zone_center_rel = (self._aim_zone + 0.5) / PADDLE_ZONES
         self.target_x = x_contact - zone_center_rel * PADDLE_W
 
     def update(self, dt, balls):
@@ -315,10 +351,12 @@ def make_bricks(rows=BRICK_ROWS, top=BRICK_TOP):
     return bricks
 
 
-def reflect_off_paddle(ball, paddle, downward=False):
+def reflect_off_paddle(ball, paddle, downward=False, angle_jitter=0.0):
     """Atari 5-zone reflection. downward=True flips the bounce direction
     (used for the AI paddle which reflects the ball back toward the
-    player)."""
+    player). angle_jitter (radians) adds a small uniform noise to the
+    reflection angle on AI bounces, which keeps two perfect AIs from
+    collapsing into a finite-state cycle in the demo modes."""
     rel = (ball.x - paddle.x) / PADDLE_W
     rel = max(0.0, min(1.0, rel))
     zone = int(rel * PADDLE_ZONES)
@@ -327,6 +365,10 @@ def reflect_off_paddle(ball, paddle, downward=False):
     half = (PADDLE_ZONES - 1) * 0.5
     t = (zone - half) / half
     angle = math.radians(60.0) * t
+    if angle_jitter:
+        angle += random.uniform(-angle_jitter, angle_jitter)
+    # Clamp to slightly less than 90deg so vy stays well non-zero.
+    angle = max(-math.radians(75.0), min(math.radians(75.0), angle))
     speed = min(BALL_SPEED_MAX, ball.speed * BALL_SPEEDUP)
     ball.speed = speed
     ball.vx = math.sin(angle) * speed
@@ -550,23 +592,27 @@ class Game:
                 self.lose_ball(b)
                 return
 
-        # Player paddle.
+        # Player paddle. In demo mode the bottom paddle is AI-driven,
+        # so apply the same reflection-angle jitter.
         prect = self.paddle.rect
         hit, nx, ny, pdx, pdy = aabb_circle_collision(prect, b.x, b.y, BALL_R)
         if hit and b.vy > 0:
             b.x += pdx; b.y += pdy
-            reflect_off_paddle(b, self.paddle, downward=False)
+            jitter = AI_ANGLE_JITTER if self.demo else 0.0
+            reflect_off_paddle(b, self.paddle, downward=False,
+                               angle_jitter=jitter)
             self.flash_timer = 0.12
             if self.mode == "ai":
                 self.add_score(AI_PLAYER_HIT_BONUS)
 
-        # AI paddle (vs-AI only).
+        # AI paddle (vs-AI only). Always uses jitter.
         if self.ai is not None:
             arect = self.ai.rect
             hit, nx, ny, pdx, pdy = aabb_circle_collision(arect, b.x, b.y, BALL_R)
             if hit and b.vy < 0:
                 b.x += pdx; b.y += pdy
-                reflect_off_paddle(b, self.ai, downward=True)
+                reflect_off_paddle(b, self.ai, downward=True,
+                                   angle_jitter=AI_ANGLE_JITTER)
                 self.ai_flash_timer = 0.12
                 self.add_score(AI_RETURN_BONUS)
 
