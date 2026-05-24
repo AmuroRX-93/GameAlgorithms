@@ -168,6 +168,11 @@ class AIPaddle:
         # paddle doesn't twitch every frame chasing fresh random choices.
         self._aim_key = None
         self._aim_zone = None
+        # Set to True every frame we don't see an incoming threat (ball
+        # is heading away from us). Next time a threat appears we know
+        # it's a new rally and must resample, even if it's the same
+        # ball object.
+        self._between_rallies = True
 
     @property
     def rect(self):
@@ -212,6 +217,9 @@ class AIPaddle:
                 threat = b
         if threat is None:
             self.target_x = FIELD.centerx - PADDLE_W * 0.5
+            # Mark that we've seen at least one frame without a threat;
+            # the next threat will be considered a fresh rally.
+            self._between_rallies = True
             return
 
         x_contact = _fold_into_field(threat.x + threat.vx * best_t)
@@ -264,11 +272,14 @@ class AIPaddle:
             and self.bottom  # only the demo's bottom paddle
         )
 
-        # Resample only when this is a new rally (different ball or
-        # the ball's vy flipped sign), so the paddle commits to one
-        # aim and doesn't twitch every frame.
-        key = (id(threat), threat.vy > 0)
-        if key != self._aim_key:
+        # Resample only when this is a new rally (different ball or we
+        # just transitioned out of a "no incoming threat" state). Using
+        # only id(threat) was wrong: with one ball in play the id never
+        # changes, so the AI would never re-pick a zone and both paddles
+        # ended up locked on whatever they chose first -- which is what
+        # was making them always shoot the same direction.
+        key = id(threat)
+        if key != self._aim_key or self._between_rallies:
             brick_bonus = [0.0] * PADDLE_ZONES
             zone_hit_t = [None] * PADDLE_ZONES
             if use_brick_aim:
@@ -332,6 +343,9 @@ class AIPaddle:
                             break
             self._aim_key = key
             self._aim_zone = chosen
+        # Inside a rally now, lock the decision until the ball flies
+        # away and comes back.
+        self._between_rallies = False
 
         zone_center_rel = (self._aim_zone + 0.5) / PADDLE_ZONES
         self.target_x = x_contact - zone_center_rel * PADDLE_W
