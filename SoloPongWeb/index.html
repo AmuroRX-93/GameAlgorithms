@@ -40,25 +40,25 @@
     border-radius: 4px;
     box-shadow: 0 0 0 1px #2a3148, 0 12px 40px rgba(0,0,0,0.6);
   }
-  /* Hint shown until the user clicks once (some browsers gate audio /
-     pointer-lock that way). Doesn't actually block input. */
+  /* Hint shown above the canvas in the letterbox area. Doesn't overlap
+     the playfield. Hidden once gameplay starts (JS toggles .hidden). */
   #hint {
     position: absolute;
-    top: 8px;
+    bottom: calc(100% + 6px);
     left: 50%;
     transform: translateX(-50%);
-    padding: 4px 10px;
     color: #7d859f;
     font-size: 11px;
     pointer-events: none;
-    opacity: 0.6;
+    white-space: nowrap;
   }
+  #hint.hidden { display: none; }
 </style>
 </head>
 <body>
 <div id="wrap">
   <canvas id="game" width="960" height="720"></canvas>
-  <div id="hint">Click canvas to focus &mdash; 1 / 2 / 3 / 4 to start</div>
+  <div id="hint">Click here to focus, then press 1 / 2 / 3 / 4</div>
 </div>
 <script>
 "use strict";
@@ -914,6 +914,7 @@ function drawMenuButton(ctx, hover) {
 (function main() {
   const canvas = document.getElementById("game");
   const ctx = canvas.getContext("2d");
+  const hintEl = document.getElementById("hint");
   // The CSS sizes the canvas; the backing buffer is fixed at WIDTH x HEIGHT.
   // We render in canvas coordinates directly; the browser scales it.
   ctx.imageSmoothingEnabled = false;
@@ -995,8 +996,10 @@ function drawMenuButton(ctx, hover) {
 
     if (scene === "menu") {
       drawMenu(ctx);
+      hintEl.classList.remove("hidden");
     } else {
       game.update(dt, keys, mouseX, mouseInside);
+      hintEl.classList.add("hidden");
       drawField(ctx);
       drawBricks(ctx, game.bricks);
       drawPaddle(ctx, game.paddle, game.flashTimer,
