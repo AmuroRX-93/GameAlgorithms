@@ -53,15 +53,17 @@ python pong.py
 
 - **Two modes**, picked from the menu (`1` solo, `2` vs AI).
 - **Perfect AI opponent.** In vs-AI mode the top paddle simulates an
-  unbeatable ghost. (1) It predicts where the ball will arrive at
-  its y-plane, mirroring x against the side walls so wall
-  reflections are baked into the target. (2) It chooses *which side*
-  of itself the ball should hit by looking at the player's current
-  x: it always sends the ball to the side opposite the player. (3)
-  It places the contact point in the paddle's edge zone
-  (`AI_AIM_OFFSET = 0.85` of half-paddle), so the 5-zone reflector
-  fires the ball back at the steepest ±60° bounce. The result: the
-  player has to chase corner to corner.
+  unbeatable strategist. (1) It predicts where the ball will arrive
+  at its y-plane, mirroring x against the side walls so wall
+  reflections are baked into the target. (2) It enumerates all 5
+  reflection zones, simulates the ball's onward trajectory for each
+  one (folding side-wall reflections in), and picks the zone whose
+  *landing point at the player's paddle plane* is the **farthest
+  from the player's current x**. (3) It positions itself so the
+  ball lands in the chosen zone's center, locking that bounce in.
+  The result: every return is calibrated to make the player chase,
+  using the full toolkit of -60°, -30°, 0°, +30°, +60° angles plus
+  side-wall bank shots.
 - **Survival scoring.** vs-AI mode awards 5 points/sec just for
   staying alive, plus 10 per AI return and 5 per player return.
 - **Bricks** (solo only). A 5×12 wall up top; smashing them all
@@ -79,9 +81,9 @@ python pong.py
 ## Tuning
 
 All knobs live as constants near the top of `pong.py`:
-`PADDLE_W`, `PADDLE_SPEED`, `AI_PADDLE_SPEED`, `AI_AIM_OFFSET`,
+`PADDLE_W`, `PADDLE_SPEED`, `AI_PADDLE_SPEED`,
 `AI_SURVIVAL_PER_SEC`, `AI_RETURN_BONUS`, `BALL_SPEED_START`,
 `BALL_SPEED_MAX`, `BALL_SPEEDUP`, `BRICK_ROWS`, `BRICK_COLS`,
 `EXTRA_BALL_EVERY`, `MAX_BALLS`. The 5-zone reflection lives in
-`reflect_off_paddle`; the AI's prediction and aiming live in
+`reflect_off_paddle`; the AI's prediction and zone search live in
 `AIPaddle.think`.

@@ -46,15 +46,12 @@ AI_PADDLE_Y = FIELD.top + 24       # AI paddle y in vs-AI mode
 PADDLE_SPEED = 720.0
 PADDLE_ZONES = 5
 
-# AI tuning. The AI is fast enough to always reach its target; the
-# return-aim strategy makes it actually fun. Instead of meeting the
-# ball at paddle center (which produces 90deg returns), the AI biases
-# the contact point toward an edge zone so the bounce angle is large.
-# AI_AIM_OFFSET is the contact point as a fraction of half-paddle-width:
-# 0.85 means hit the ball at 85% out from center, deep in the edge
-# zone of the 5-zone reflection table.
+# AI tuning. The AI is fast enough to always reach its target. The
+# real challenge for the player comes from where the AI aims: it
+# enumerates the 5 reflection zones, simulates each one, and picks
+# the return that lands farthest from the player's current x. See
+# AIPaddle.think.
 AI_PADDLE_SPEED = 1200.0
-AI_AIM_OFFSET = 0.85
 
 BALL_R = 7
 BALL_SPEED_START = 380.0
@@ -154,15 +151,19 @@ class AIPaddle:
         return pygame.Rect(int(self.x), int(self.y), PADDLE_W, PADDLE_H)
 
     def think(self, balls):
-        """Pick the most-threatening ball heading up, predict its x at
-        self.y including left/right wall reflections, and aim our center
-        at that x (with a tiny deliberate offset so returns vary)."""
+        """For each incoming ball, plan a return that maximizes the
+        distance between the ball's eventual x at the player's paddle
+        plane and the player's current x. We enumerate the 5 reflection
+        zones, simulate the resulting trajectory (including side-wall
+        reflections via mirror folding), and pick the zone with the
+        farthest landing offset from the player. Then we set our paddle
+        target so the ball will hit that exact zone."""
+        # Find the most threatening incoming ball (smallest time-to-arrival).
         threat = None
         best_t = float("inf")
         for b in balls:
             if not b.alive or b.vy >= 0:
                 continue
-            # Time until the ball center reaches our paddle plane.
             t = (self.y + PADDLE_H - b.y) / b.vy
             if t < 0:
                 continue
@@ -170,39 +171,47 @@ class AIPaddle:
                 best_t = t
                 threat = b
         if threat is None:
-            # No incoming ball: glide back to center to look ready.
             self.target_x = FIELD.centerx - PADDLE_W * 0.5
             return
 
-        # Predict landing x via mirror-reflection of the field width.
-        x_pred = threat.x + threat.vx * best_t
-        span = FIELD.width
-        # Map x_pred into [FIELD.left, FIELD.right] by repeated reflection.
-        rel = x_pred - FIELD.left
-        period = 2 * span
-        rel = rel % period
-        if rel < 0:
-            rel += period
-        if rel > span:
-            rel = period - rel
-        x_land = FIELD.left + rel
+        # 1) Where will the ball cross our paddle plane (with wall
+        # reflections folded in)? This is also where the contact point
+        # will be on our paddle along x.
+        x_contact = _fold_into_field(threat.x + threat.vx * best_t)
 
-        # Decide which direction to send the ball. We aim away from the
-        # player's current paddle x so the player has to chase.
+        # 2) Player's current center.
         player_cx = (self.player.x + PADDLE_W * 0.5
                      if self.player is not None else FIELD.centerx)
-        send_right = player_cx < FIELD.centerx
 
-        # In the 5-zone reflector, hitting the ball with the paddle's
-        # right edge produces a +vx bounce (ball heads right). To send
-        # the ball right we therefore want the ball to land on the
-        # right side of the paddle, i.e. paddle center is offset to
-        # the LEFT of x_land by AI_AIM_OFFSET * (PADDLE_W/2).
-        contact = AI_AIM_OFFSET * (PADDLE_W * 0.5)
-        if send_right:
-            self.target_x = x_land - PADDLE_W * 0.5 - contact
-        else:
-            self.target_x = x_land - PADDLE_W * 0.5 + contact
+        # 3) Simulate each of the 5 zones and pick the one whose
+        # outgoing ball reaches the player plane farthest from the
+        # player's current x. The zone we pick determines the contact
+        # offset on our paddle, which in turn pins down our target_x.
+        out_speed = min(BALL_SPEED_MAX, threat.speed * BALL_SPEEDUP)
+        dy = PADDLE_Y - (self.y + PADDLE_H)   # vertical distance to player plane
+        half = (PADDLE_ZONES - 1) * 0.5
+
+        best_zone = 0
+        best_dist = -1.0
+        for zone in range(PADDLE_ZONES):
+            t_zone = (zone - half) / half       # -1..+1
+            angle = math.radians(60.0) * t_zone
+            vx_out = math.sin(angle) * out_speed
+            vy_out = math.cos(angle) * out_speed   # downward, > 0
+            # Time for ball to reach player plane.
+            travel_t = dy / max(vy_out, 1e-3)
+            x_arrive = _fold_into_field(x_contact + vx_out * travel_t)
+            dist = abs(x_arrive - player_cx)
+            if dist > best_dist:
+                best_dist = dist
+                best_zone = zone
+
+        # 4) Place our paddle so the ball lands in the chosen zone.
+        # zone is determined by rel = (ball_x - paddle_x) / PADDLE_W
+        # bucketed into 5 slots. We aim the ball at the *center* of the
+        # chosen zone so it doesn't slip into a neighbor under noise.
+        zone_center_rel = (best_zone + 0.5) / PADDLE_ZONES
+        self.target_x = x_contact - zone_center_rel * PADDLE_W
 
     def update(self, dt, balls):
         self.think(balls)
@@ -248,6 +257,20 @@ class Brick:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _fold_into_field(x):
+    """Mirror-fold an arbitrary x coordinate into [FIELD.left, FIELD.right],
+    so a ball traveling in a straight line through the side walls ends
+    up at the same x as if it had reflected off them."""
+    span = FIELD.width
+    period = 2.0 * span
+    rel = (x - FIELD.left) % period
+    if rel < 0:
+        rel += period
+    if rel > span:
+        rel = period - rel
+    return FIELD.left + rel
 
 
 def make_bricks(rows=BRICK_ROWS, top=BRICK_TOP):
