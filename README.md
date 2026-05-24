@@ -5,7 +5,10 @@ in Python with `pygame` and `numpy`. Each project is self-contained,
 visualizes the algorithm in real time, and exposes its parameters as
 sliders so you can play with them.
 
-Run any of them like this:
+**Play in your browser:** <https://amurorx-93.github.io/GameAlgorithms/>
+(currently SoloPong; more demos to come.)
+
+Run any of them locally:
 
 ```bash
 cd <project>
@@ -46,6 +49,8 @@ python <main>.py
 ### Games
 - **[SoloPong](SoloPong/)** — Single-player Pong with bricks, multi-ball,
   and CRT-style scanlines. Atari-style 5-zone paddle reflection.
+  Includes an AI opponent that never misses and two AI demo modes.
+  [Play in browser](https://amurorx-93.github.io/GameAlgorithms/SoloPong/).
 
 ## Stack
 

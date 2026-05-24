@@ -1,0 +1,68 @@
+name: Deploy SoloPong to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'SoloPong/**'
+      - 'site/**'
+      - '.github/workflows/deploy-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pygbag
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pygbag
+
+      - name: Build SoloPong with pygbag
+        # pygbag --build packages SoloPong/ into SoloPong/build/web/
+        # without starting its dev server. The runtime is fetched from
+        # the pygame-web archive and bundled into the output.
+        run: |
+          python -m pygbag --build SoloPong
+
+      - name: Stage site
+        # Layout we deploy:
+        #   /                -> landing page (links to each playable demo)
+        #   /SoloPong/       -> the pygbag bundle
+        run: |
+          mkdir -p _site/SoloPong
+          cp -R SoloPong/build/web/. _site/SoloPong/
+          cp site/index.html _site/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -2,6 +2,8 @@
 
 Four flavors in one binary, picked from the start menu.
 
+**Play in your browser:** <https://amurorx-93.github.io/GameAlgorithms/SoloPong/>
+
 ## Modes
 
 ### 1. Solo (Atari + Breakout)
