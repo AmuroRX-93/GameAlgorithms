@@ -60,6 +60,13 @@ LABEL_INSET = 8
 
 BATTLE_LIVES = 3
 
+# Per-rally chance that an AI commits to a "wrong" target and lets the
+# ball through. With four paddles (one human, three AIs) on the field,
+# perfect AIs would simply rally between themselves forever once the
+# human paddle dies. A small fumble rate keeps games finite and gives
+# AIs a chance to lose too.
+AI_MISS_RATE = 0.12
+
 
 def _other_sides(side):
     return tuple(s for s in SIDES if s != side)
@@ -327,9 +334,18 @@ def _predict_arrival(side, ball):
 def _ai_target_slide(paddle, balls):
     """Where (in slide-axis coords) should this AI paddle's top-left
     corner be? We pick the soonest-arriving threat. If no ball is
-    heading our way, drift back toward the center."""
+    heading our way, drift back toward the center.
+
+    With three perfect AIs in play, AI-vs-AI rallies would never end.
+    To keep the game finite (and to give the human a fighting chance
+    in the survival race), each AI has a small per-rally chance to
+    "fumble" -- it commits to a target offset that misses the ball by
+    enough to drop it. The fumble is decided once per ball
+    direction-flip, so a single mistake doesn't spam every frame; it's
+    a clean miss, not a jitter."""
     best_t = float("inf")
     best_arrive = None
+    best_ball = None
     for b in balls:
         if not b.alive:
             continue
@@ -339,17 +355,34 @@ def _ai_target_slide(paddle, balls):
         if t < best_t:
             best_t = t
             best_arrive = arrive
+            best_ball = b
 
     if best_arrive is None:
         # Idle: glide to center of our slide range.
+        paddle._fumble_key = None
         _, lo, hi = _paddle_axis(paddle.side)
         return (lo + hi) * 0.5
 
     extent = _slide_extent(paddle.side)
-    # Center the paddle on the predicted arrival point. We deliberately
-    # don't pick edge zones to "attack" -- with 4 paddles around the
-    # field a perfect blocker is plenty challenging.
-    return best_arrive - extent * 0.5
+    base = best_arrive - extent * 0.5
+
+    # Decide whether to fumble this rally. Re-decide only when the
+    # threat ball changes (different identity), so within one approach
+    # the paddle moves smoothly to a single (possibly wrong) target.
+    key = id(best_ball)
+    if getattr(paddle, "_fumble_key", None) != key:
+        paddle._fumble_key = key
+        if random.random() < AI_MISS_RATE:
+            # Pick an offset roughly one paddle-length to one side.
+            # That guarantees a clean miss without looking robotic.
+            offset = extent * random.uniform(0.9, 1.4)
+            if random.random() < 0.5:
+                offset = -offset
+            paddle._fumble_offset = offset
+        else:
+            paddle._fumble_offset = 0.0
+
+    return base + paddle._fumble_offset
 
 
 # ---------------------------------------------------------------------------
