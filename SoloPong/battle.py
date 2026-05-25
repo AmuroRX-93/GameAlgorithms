@@ -334,30 +334,30 @@ def _predict_arrival(side, ball):
 def _enemy_paddle(paddle, paddles, player_side):
     """Pick which other paddle this AI is "hunting" right now.
 
-    Strategy: while the human is alive, every AI gangs up on the
-    human (makes the human-vs-3-AIs fantasy actually feel like 1v3).
-    Once the human dies, switch to a stable pairing: each AI locks
-    onto the survivor whose side faces it across the field. That
-    keeps the AI-vs-AI endgame as targeted duels, so somebody loses
-    their lives quickly instead of three perfect-aim paddles forming
-    a stable triangle. Returns None if there's no valid target."""
+    Old strategy was "all AIs gang up on the human", which made AIs
+    never attack each other. New strategy: each AI defaults to its
+    *opposite* side -- if the AI is on top, it hunts whoever's on
+    bottom -- so attacks naturally radiate across the field. The
+    human ends up being targeted by the AI sitting on the opposite
+    edge, and the other two AIs duke it out across the perpendicular
+    axis.
+
+    Falls back to the surviving opponent with the most lives if the
+    opposite side is already eliminated. Returns None if there's no
+    valid target."""
     candidates = [
         p for p in paddles.values()
         if p.alive and p.side != paddle.side
     ]
     if not candidates:
         return None
-    human = paddles.get(player_side)
-    if human is not None and human.alive and human.side != paddle.side:
-        return human
 
-    # All-AI phase: prefer the paddle on the opposite side.
     opposite = {"top": "bottom", "bottom": "top",
                 "left": "right", "right": "left"}
     opp = paddles.get(opposite[paddle.side])
     if opp is not None and opp.alive:
         return opp
-    # Fallback: surviving opponent with most lives.
+
     side_priority = {s: i for i, s in enumerate(SIDES)}
     candidates.sort(
         key=lambda p: (-p.lives, side_priority[p.side]))
