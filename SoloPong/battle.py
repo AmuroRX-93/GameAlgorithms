@@ -331,10 +331,115 @@ def _predict_arrival(side, ball):
         return y_arrive, t
 
 
-def _ai_target_slide(paddle, balls):
+def _enemy_paddle(paddle, paddles, player_side):
+    """Pick which other paddle this AI is "hunting" right now.
+
+    Strategy: while the human is alive, every AI gangs up on the
+    human (makes the human-vs-3-AIs fantasy actually feel like 1v3).
+    Once the human dies, switch to a stable pairing: each AI locks
+    onto the survivor whose side faces it across the field. That
+    keeps the AI-vs-AI endgame as targeted duels, so somebody loses
+    their lives quickly instead of three perfect-aim paddles forming
+    a stable triangle. Returns None if there's no valid target."""
+    candidates = [
+        p for p in paddles.values()
+        if p.alive and p.side != paddle.side
+    ]
+    if not candidates:
+        return None
+    human = paddles.get(player_side)
+    if human is not None and human.alive and human.side != paddle.side:
+        return human
+
+    # All-AI phase: prefer the paddle on the opposite side.
+    opposite = {"top": "bottom", "bottom": "top",
+                "left": "right", "right": "left"}
+    opp = paddles.get(opposite[paddle.side])
+    if opp is not None and opp.alive:
+        return opp
+    # Fallback: surviving opponent with most lives.
+    side_priority = {s: i for i, s in enumerate(SIDES)}
+    candidates.sort(
+        key=lambda p: (-p.lives, side_priority[p.side]))
+    return candidates[0]
+
+
+def _zone_outgoing(paddle, contact_along, zone, out_speed):
+    """For a paddle on `paddle.side`, given the contact point along
+    the paddle's slide axis (a coordinate, not a relative) and a zone
+    index 0..PADDLE_ZONES-1, return the outgoing (vx, vy) of the ball
+    after a clean reflect (no jitter, no anti-vertical guard -- this
+    is the AI's *plan*, not a real physics step).
+
+    contact_along is x for top/bottom paddles, y for left/right."""
+    half = (PADDLE_ZONES - 1) * 0.5
+    t = (zone - half) / half
+    angle = math.radians(60.0) * t
+    side = paddle.side
+    if side in ("top", "bottom"):
+        n_sign = 1 if side == "top" else -1     # vy after bounce
+        vx = math.sin(angle) * out_speed
+        vy = math.cos(angle) * out_speed * n_sign
+    else:
+        n_sign = 1 if side == "left" else -1    # vx after bounce
+        vy = math.sin(angle) * out_speed
+        vx = math.cos(angle) * out_speed * n_sign
+    return vx, vy
+
+
+def _arrive_offset_from_enemy(paddle, contact_along, zone, out_speed,
+                               enemy):
+    """Simulate the bounced trajectory and return how far it lands
+    from `enemy`'s current paddle center (in enemy's slide-axis units).
+    Larger == harder for enemy to reach. Wall reflections on the two
+    perpendicular walls are handled by mirror-folding.
+
+    Returns (offset, hit_enemy_plane: bool). hit_enemy_plane is False
+    when the bounced ball never reaches the enemy's contact plane
+    (e.g. the geometry doesn't intersect that side at all)."""
+    vx, vy = _zone_outgoing(paddle, contact_along, zone, out_speed)
+
+    # Where does the ball start? At the paddle's contact plane, at
+    # contact_along on the slide axis.
+    paddle_axis, paddle_plane = _contact_axis(paddle.side)
+    if paddle_axis == "y":
+        x0, y0 = contact_along, paddle_plane
+    else:
+        x0, y0 = paddle_plane, contact_along
+
+    enemy_axis, enemy_plane = _contact_axis(enemy.side)
+    if enemy_axis == "y":
+        # Need vy != 0 in the right direction to ever reach the plane.
+        if vy == 0 or (enemy_plane - y0) * vy < 0:
+            return 0.0, False
+        t = (enemy_plane - y0) / vy
+        if t <= 0:
+            return 0.0, False
+        x_at = _fold_into_range(x0 + vx * t, FIELD.left, FIELD.right)
+        enemy_cx = enemy.x + _slide_extent(enemy.side) * 0.5
+        return abs(x_at - enemy_cx), True
+    else:
+        if vx == 0 or (enemy_plane - x0) * vx < 0:
+            return 0.0, False
+        t = (enemy_plane - x0) / vx
+        if t <= 0:
+            return 0.0, False
+        y_at = _fold_into_range(y0 + vy * t, FIELD.top, FIELD.bottom)
+        enemy_cy = enemy.y + _slide_extent(enemy.side) * 0.5
+        return abs(y_at - enemy_cy), True
+
+
+def _ai_target_slide(paddle, balls, paddles=None, player_side=None):
     """Where (in slide-axis coords) should this AI paddle's top-left
-    corner be? We pick the soonest-arriving threat. If no ball is
-    heading our way, drift back toward the center.
+    corner be?
+
+    Two-step plan:
+      1. Predict where the soonest-incoming ball will arrive at our
+         contact plane.
+      2. If we have an enemy locked, evaluate the 5 reflection zones
+         and pick the one whose post-bounce trajectory lands farthest
+         from the enemy paddle. Place ourselves so the ball hits *that
+         zone* of our paddle, not just our center.
 
     With three perfect AIs in play, AI-vs-AI rallies would never end.
     To keep the game finite (and to give the human a fighting chance
@@ -358,30 +463,73 @@ def _ai_target_slide(paddle, balls):
             best_ball = b
 
     if best_arrive is None:
-        # Idle: glide to center of our slide range.
         paddle._fumble_key = None
         _, lo, hi = _paddle_axis(paddle.side)
         return (lo + hi) * 0.5
 
     extent = _slide_extent(paddle.side)
-    base = best_arrive - extent * 0.5
 
-    # Decide whether to fumble this rally. Re-decide only when the
-    # threat ball changes (different identity), so within one approach
-    # the paddle moves smoothly to a single (possibly wrong) target.
+    # Pick a zone to aim for. Without an enemy reference (shouldn't
+    # happen in normal battle, but kept for robustness) we fall back
+    # to dead-center placement.
+    enemy = (_enemy_paddle(paddle, paddles, player_side)
+             if paddles is not None else None)
+
+    # Cache the choice per rally so the paddle moves smoothly to its
+    # target instead of re-evaluating zones every frame and twitching.
     key = id(best_ball)
-    if getattr(paddle, "_fumble_key", None) != key:
-        paddle._fumble_key = key
+    if getattr(paddle, "_aim_key", None) != key:
+        paddle._aim_key = key
+        # Fumble decision is also per-rally so a miss is decisive.
         if random.random() < AI_MISS_RATE:
-            # Pick an offset roughly one paddle-length to one side.
-            # That guarantees a clean miss without looking robotic.
-            offset = extent * random.uniform(0.9, 1.4)
+            paddle._fumble_offset = extent * random.uniform(0.9, 1.4)
             if random.random() < 0.5:
-                offset = -offset
-            paddle._fumble_offset = offset
+                paddle._fumble_offset = -paddle._fumble_offset
         else:
             paddle._fumble_offset = 0.0
 
+        if enemy is None:
+            paddle._aim_zone = (PADDLE_ZONES - 1) // 2
+        else:
+            # Find the threat ball's speed for outgoing speedup math.
+            out_speed = min(BALL_SPEED_MAX, best_ball.speed * BALL_SPEEDUP)
+            scores = []
+            any_hit = False
+            for z in range(PADDLE_ZONES):
+                offset, hit = _arrive_offset_from_enemy(
+                    paddle, best_arrive, z, out_speed, enemy)
+                if hit:
+                    any_hit = True
+                scores.append(offset if hit else -1.0)
+            if any_hit:
+                # Weighted random over zones, biased heavily toward
+                # the farthest. Pure argmax would make every AI
+                # paddle pick the same edge zone every rally and
+                # rallies would loop; the bias + randomness breaks
+                # the symmetry.
+                max_s = max(scores) or 1.0
+                weights = [(max(0.0, s) / max_s) ** 2 + 0.18 for s in scores]
+                total = sum(weights)
+                r = random.random() * total
+                acc = 0.0
+                chosen = 0
+                for i, w in enumerate(weights):
+                    acc += w
+                    if r <= acc:
+                        chosen = i
+                        break
+                paddle._aim_zone = chosen
+            else:
+                # No zone reaches the enemy plane (rare; unusual
+                # geometry like the enemy is on the same axis).
+                paddle._aim_zone = (PADDLE_ZONES - 1) // 2
+
+    # Place ourselves so contact happens in the chosen zone.
+    # The ball arrives at coord `best_arrive` along our slide axis;
+    # we want that coord to land inside zone `_aim_zone` of our
+    # paddle. Zone center as a fraction of paddle length:
+    zone_center_rel = (paddle._aim_zone + 0.5) / PADDLE_ZONES
+    base = best_arrive - zone_center_rel * extent
     return base + paddle._fumble_offset
 
 
@@ -472,7 +620,10 @@ class BattleGame:
             if p.controller == "human":
                 p.update_human(dt, keys, mouse_pos)
             else:
-                target = _ai_target_slide(p, self.balls)
+                target = _ai_target_slide(
+                    p, self.balls,
+                    paddles=self.paddles,
+                    player_side=self.player_side)
                 p.update_ai(dt, target)
 
         if self.state in ("ready", "paused", "gameover"):
