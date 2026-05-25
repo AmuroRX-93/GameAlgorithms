@@ -886,8 +886,12 @@ def draw_menu(screen, font_big, font_med, font_small):
                            True, ACCENT)
     screen.blit(opt4, opt4.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 118)))
 
+    opt5 = font_med.render("[5]  BATTLE  -  1 vs 3 AIs, last paddle wins",
+                           True, TEXT)
+    screen.blit(opt5, opt5.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 150)))
+
     foot = font_small.render("Esc to quit.", True, TEXT_DIM)
-    screen.blit(foot, foot.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 170)))
+    screen.blit(foot, foot.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 200)))
 
 
 def draw_scanlines(screen):
@@ -937,15 +941,23 @@ async def main():
     font_med = pygame.font.SysFont("Menlo,Consolas,monospace", 18, bold=True)
     font_small = pygame.font.SysFont("Menlo,Consolas,monospace", 12)
 
+    # Battle mode lives in its own module so the geometry split (4
+    # paddles, 4 sides) doesn't pollute Game's collision branches.
+    import battle
+
     pygame.mouse.set_visible(True)
 
-    # Top-level scene: "menu" or "play".
+    # Top-level scene: "menu", "picker" (battle side picker), or "play".
     scene = "menu"
     game = None
 
     def start(mode, demo=False):
         g = Game(mode=mode, demo=demo)
         g.attach_ball_to_paddle()
+        return g
+
+    def start_battle(side):
+        g = battle.BattleGame(player_side=side)
         return g
 
     running = True
@@ -970,6 +982,8 @@ async def main():
                     if scene == "play":
                         scene = "menu"
                         game = None
+                    elif scene == "picker":
+                        scene = "menu"
                     else:
                         running = False
                 elif scene == "menu":
@@ -987,11 +1001,28 @@ async def main():
                         # AI plays solo demo.
                         game = start("solo", demo=True)
                         scene = "play"
+                    elif event.key == pygame.K_5:
+                        # Battle: 1 vs 3 AIs. Side picker first.
+                        scene = "picker"
+                elif scene == "picker":
+                    # Quick keyboard shortcut: T/B/L/R picks a side.
+                    side_map = {
+                        pygame.K_t: "top",
+                        pygame.K_b: "bottom",
+                        pygame.K_l: "left",
+                        pygame.K_r: "right",
+                    }
+                    if event.key in side_map:
+                        game = start_battle(side_map[event.key])
+                        scene = "play"
                 else:
-                    if event.key == pygame.K_SPACE and not game.demo:
+                    if event.key == pygame.K_SPACE and not getattr(game, "demo", False):
                         if game.state == "ready":
                             game.state = "playing"
-                            game.launch_pinned_ball()
+                            if game.mode == "battle":
+                                game.launch_ball()
+                            else:
+                                game.launch_pinned_ball()
                         elif game.state == "playing":
                             game.state = "paused"
                         elif game.state == "paused":
@@ -1006,9 +1037,20 @@ async def main():
                 if scene == "play" and menu_btn_rect.collidepoint(event.pos):
                     scene = "menu"
                     game = None
+                elif scene == "picker":
+                    side = battle.hovered_side(event.pos)
+                    if side is not None:
+                        game = start_battle(side)
+                        scene = "play"
             elif event.type == pygame.MOUSEMOTION:
-                if scene == "play" and game is not None and not game.demo:
+                if (scene == "play" and game is not None
+                        and getattr(game, "mode", None) != "battle"
+                        and not getattr(game, "demo", False)):
                     game.paddle.notice_mouse_move(mouse_pos)
+                elif (scene == "play" and game is not None
+                        and getattr(game, "mode", None) == "battle"):
+                    p = game.paddles[game.player_side]
+                    p.notice_mouse_move()
 
         # ---- Render -----------------------------------------------------
         screen.fill(BEZEL)
@@ -1020,6 +1062,17 @@ async def main():
             draw_field(layer)
             screen.blit(layer, (0, 0))
             draw_menu(screen, font_big, font_med, font_small)
+        elif scene == "picker":
+            battle.draw_side_picker(
+                screen, (font_big, font_med, font_small),
+                battle.hovered_side(mouse_pos),
+            )
+        elif getattr(game, "mode", None) == "battle":
+            game.update(dt, keys, mouse_pos)
+            battle.draw_battle(
+                screen, (font_big, font_med, font_small),
+                game, mouse_pos,
+            )
         else:
             game.update(dt, keys, mouse_pos)
 
